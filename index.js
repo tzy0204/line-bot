@@ -27,7 +27,11 @@ app.post('/webhook', line.middleware(config), (req, res) => {
     .all(req.body.events.map(handleEvent))
     .then((result) => res.json(result))
     .catch((err) => {
-      console.error(err);
+      if (err.response) {
+        console.error('LINE API Error:', JSON.stringify(err.response.data, null, 2));
+      } else {
+        console.error('Webhook Error:', err.message || err);
+      }
       res.status(500).end();
     });
 });
@@ -36,32 +40,107 @@ app.post('/webhook', line.middleware(config), (req, res) => {
 async function handleEvent(event) {
   console.log('Received event:', JSON.stringify(event, null, 2));
 
-  if (event.type !== 'message' || event.message.type !== 'text') {
-    // ignore non-text-message event
-    return Promise.resolve(null);
-  }
-
   try {
-    // Generate AI response using Gemini 2.5 Flash
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: event.message.text,
-    });
+    // 1. 處理一般文字訊息 (一般 AI 聊天)
+    if (event.type === 'message' && event.message.type === 'text') {
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: event.message.text,
+      });
 
-    const aiReplyText = response.text;
+      return client.replyMessage(event.replyToken, { type: 'text', text: response.text });
+    }
 
-    // create a text message with the AI's reply
-    const replyMessage = { type: 'text', text: aiReplyText };
+    // 2. 處理語音訊息 (彈出快速回覆選單)
+    if (event.type === 'message' && event.message.type === 'audio') {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: '收到語音！請選擇您希望我幫忙處理的方式：',
+        quickReply: {
+          items: [
+            {
+              type: 'action',
+              action: {
+                type: 'postback',
+                label: '✨ 幫我潤飾',
+                data: `action=polish&msgId=${event.message.id}`,
+                displayText: '請幫我潤飾這段語音'
+              }
+            },
+            {
+              type: 'action',
+              action: {
+                type: 'postback',
+                label: '🔤 翻譯英文',
+                data: `action=translate&msgId=${event.message.id}`,
+                displayText: '請幫我將這段語音翻譯成英文'
+              }
+            }
+          ]
+        }
+      });
+    }
 
-    // use reply API
-    return client.replyMessage(event.replyToken, replyMessage);
+    // 3. 處理使用者點擊快速回覆的事件 (進行語音處理)
+    if (event.type === 'postback' && event.postback.data) {
+      const data = new URLSearchParams(event.postback.data);
+      const action = data.get('action');
+      const msgId = data.get('msgId');
+
+      if ((action === 'polish' || action === 'translate') && msgId) {
+        // 先回覆使用者「處理中請稍候」的訊息？但 postback 也有 replyToken，
+        // 不過 await 處理語音與呼叫 Gemini 可能需要幾秒鐘
+        // 為了避免超時或使用體驗不佳，我們可以直接處理
+
+        // 從 LINE 伺服器下載語音檔案
+        const stream = await client.getMessageContent(msgId);
+        const chunks = [];
+        for await (const chunk of stream) {
+          chunks.push(chunk);
+        }
+        const audioBuffer = Buffer.concat(chunks);
+        const base64Audio = audioBuffer.toString('base64');
+
+        // 準備 Gemini Prompt
+        const prompt = action === 'polish'
+          ? '請將這段語音轉寫成文字，修正冗言贅字並潤飾語氣，只輸出最終潤飾好的文字即可。'
+          : '請將這段語音轉寫成文字，並翻譯成流暢合適的英文。負責翻譯就好，不要回答其他多餘的內容。';
+
+        // 傳送給 Gemini 處理
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: [
+            prompt,
+            {
+              inlineData: {
+                data: base64Audio,
+                mimeType: 'audio/mp4' // LINE 語音多為 m4a/mp4
+              }
+            }
+          ]
+        });
+
+        return client.replyMessage(event.replyToken, { type: 'text', text: response.text });
+      }
+    }
+
+    // 忽略其他事件
+    return Promise.resolve(null);
   } catch (error) {
-    console.error('Error generating AI response:', error);
-    // Reply with a fallback error message so the user knows something went wrong
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: 'Sorry, I am having trouble connecting to my AI brain right now. Please try again later.'
-    });
+    if (error.response) {
+      console.error('LINE API Error in handleEvent:', JSON.stringify(error.response.data, null, 2));
+    } else {
+      console.error('Error handling event:', error.message || error);
+    }
+    if (event.replyToken) {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: '抱歉，處理過程中發生了一點錯誤，請稍後再試。'
+      }).catch(err => {
+        // catch nested errors
+        console.error('Fallback error:', err.response ? JSON.stringify(err.response.data) : err.message);
+      });
+    }
   }
 }
 
