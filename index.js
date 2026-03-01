@@ -48,12 +48,12 @@ async function handleEvent(event) {
         contents: event.message.text,
       });
 
-      return client.replyMessage(event.replyToken, { type: 'text', text: response.text });
+      return await client.replyMessage(event.replyToken, { type: 'text', text: response.text });
     }
 
     // 2. 處理語音訊息 (彈出快速回覆選單)
     if (event.type === 'message' && event.message.type === 'audio') {
-      return client.replyMessage(event.replyToken, {
+      return await client.replyMessage(event.replyToken, {
         type: 'text',
         text: '收到語音！請選擇您希望我幫忙處理的方式：',
         quickReply: {
@@ -88,10 +88,6 @@ async function handleEvent(event) {
       const msgId = data.get('msgId');
 
       if ((action === 'polish' || action === 'translate') && msgId) {
-        // 先回覆使用者「處理中請稍候」的訊息？但 postback 也有 replyToken，
-        // 不過 await 處理語音與呼叫 Gemini 可能需要幾秒鐘
-        // 為了避免超時或使用體驗不佳，我們可以直接處理
-
         // 從 LINE 伺服器下載語音檔案
         const stream = await client.getMessageContent(msgId);
         const chunks = [];
@@ -120,7 +116,7 @@ async function handleEvent(event) {
           ]
         });
 
-        return client.replyMessage(event.replyToken, { type: 'text', text: response.text });
+        return await client.replyMessage(event.replyToken, { type: 'text', text: response.text });
       }
     }
 
@@ -128,19 +124,22 @@ async function handleEvent(event) {
     return Promise.resolve(null);
   } catch (error) {
     if (error.response) {
-      console.error('LINE API Error in handleEvent:', JSON.stringify(error.response.data, null, 2));
+      console.error('LINE/Gemini API Error:', JSON.stringify(error.response.data || error.response, null, 2));
     } else {
       console.error('Error handling event:', error.message || error);
     }
+
     if (event.replyToken) {
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: '抱歉，處理過程中發生了一點錯誤，請稍後再試。'
-      }).catch(err => {
-        // catch nested errors
-        console.error('Fallback error:', err.response ? JSON.stringify(err.response.data) : err.message);
-      });
+      try {
+        return await client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: '抱歉，處理過程中發生了一點錯誤，請稍後再試。'
+        });
+      } catch (fallbackError) {
+        console.error('Fallback error:', fallbackError.message);
+      }
     }
+    return Promise.resolve(null);
   }
 }
 
