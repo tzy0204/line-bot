@@ -20,6 +20,20 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 // about Express itself: https://expressjs.com/
 const app = express();
 
+// 設計一個受保護的喚醒端點
+app.get('/wake-up', (req, res) => {
+  // 檢查請求中是否帶有正確的 token (?token=...)
+  const token = req.query.token;
+
+  // 如果沒有 token，或是 token 不正確，就回傳 403 Forbidden 裝死
+  if (token !== process.env.PING_TOKEN) {
+    return res.status(403).send('Forbidden');
+  }
+
+  // Token 正確，回傳 200 讓 UptimeRobot 知道伺服器活著
+  res.status(200).send('Awake');
+});
+
 // register a webhook handler with middleware
 // about the middleware, please refer to doc
 app.post('/webhook', line.middleware(config), (req, res) => {
