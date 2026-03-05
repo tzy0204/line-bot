@@ -30,7 +30,8 @@ app.get('/wake-up', (req, res) => {
     return res.status(403).send('Forbidden');
   }
 
-  // Token 正確，回傳 200 讓 UptimeRobot 知道伺服器活著
+  // Token 正確，印出 Log 並回傳 200 讓 UptimeRobot 知道伺服器活著
+  console.log('⏰ [UptimeRobot] Ping received. Server is awake!');
   res.status(200).send('Awake');
 });
 
