@@ -13,6 +13,16 @@ const reminderSchema = new mongoose.Schema({
         type: Date,
         required: true,
     },
+    isRecurring: {
+        type: Boolean,
+        default: false,
+    },
+    cronExpression: {
+        type: String,
+        required: function () {
+            return this.isRecurring;
+        }
+    },
     isNotified: {
         type: Boolean,
         default: false,

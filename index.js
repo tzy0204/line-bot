@@ -75,11 +75,14 @@ async function handleEvent(event) {
 請判斷這句話是不是在要求「設定提醒事項」或「定時叫我做某事」。
 現在的台灣時間是：${nowStr}
 
-如果「是」設定提醒，請你推算出精確的觸發時間 (triggerTime)，推算邏輯請以台灣時間為準，並回傳一個合法的 JSON 格式，不要有其他任何前後文、Markdown 語法或解釋。格式必須嚴格如下：
+如果「是」設定提醒，請進一步判斷這是一個「單次提醒」還是「週期性提醒（例如：每週三晚上七點、每天早上八點）」。
+推算邏輯請以台灣時間為準，並回傳一個合法的 JSON 格式，不要有其他任何前後文、Markdown 語法或解釋。格式必須嚴格如下：
 {
   "isReminder": true,
-  "task": "提醒的具體事情（例如：回診打疫苗）",
-  "triggerTime": "ISO 8601 格式的 UTC 時間字串（例如：2024-05-15T12:00:00.000Z，請記得從台灣時間轉換成 UTC）"
+  "task": "提醒的具體事情（例如：回診打疫苗、去健身）",
+  "triggerTime": "ISO 8601 格式的 UTC 時間字串，代表『下一次』要觸發的時間（例如：2024-05-15T12:00:00.000Z，請記得從台灣時間轉換成 UTC）",
+  "isRecurring": true 或 false,
+  "cronExpression": "如果是週期性提醒，請提供標準的 cron 表示式字串 (分 時 日 月 星期)，並請注意 cron 的時區是以 UTC 為準計算！例如台灣時間(UTC+8)的每天早上8點，cron 就是 '0 0 * * *'。如果不是週期性提醒，請填 null"
 }
 
 如果「不是」設定提醒（例如一般聊天、問問題），請根據你作為 AI 助理的身分，直接用平易近人的繁體中文回覆他的對話。`;
@@ -111,7 +114,9 @@ async function handleEvent(event) {
         const newReminder = new Reminder({
           userId: event.source.userId,
           task: reminderData.task,
-          triggerTime: new Date(reminderData.triggerTime)
+          triggerTime: new Date(reminderData.triggerTime),
+          isRecurring: reminderData.isRecurring || false,
+          cronExpression: reminderData.cronExpression || undefined
         });
         await newReminder.save();
 
@@ -229,6 +234,7 @@ async function handleEvent(event) {
 }
 
 const cron = require('node-cron');
+const cronParser = require('cron-parser');
 
 // 設定排程：每分鐘檢查一次過期且尚未通知的提醒
 cron.schedule('* * * * *', async () => {
@@ -250,8 +256,24 @@ cron.schedule('* * * * *', async () => {
           text: `⏰ 溫馨提醒：\n時間到囉！\n\n👉 ${reminder.task}`
         });
 
-        // 推播成功後，更新標記
-        reminder.isNotified = true;
+        if (reminder.isRecurring && reminder.cronExpression) {
+          // 如果是週期性提醒，算出下一次的時間，並更新 triggerTime
+          try {
+            const interval = cronParser.parseExpression(reminder.cronExpression, {
+              currentDate: new Date(), // 以現在時間為基準算下一次
+              tz: 'UTC' // 確保內部運算用 UTC 與資料庫一致
+            });
+            reminder.triggerTime = interval.next().toDate();
+            console.log(`🔄 週期性提醒已重新排程於：${reminder.triggerTime}`);
+          } catch (err) {
+            console.error('❌ 解析 cronExpression 失敗，改為單次提醒:', err);
+            reminder.isNotified = true;
+          }
+        } else {
+          // 單次提醒，標記為已發送
+          reminder.isNotified = true;
+        }
+
         await reminder.save();
       }
     }
