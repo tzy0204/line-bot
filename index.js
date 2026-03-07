@@ -1,9 +1,16 @@
 const express = require('express');
 const line = require('@line/bot-sdk');
 require('dotenv').config();
+const mongoose = require('mongoose');
+
+// Connect to MongoDB
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('✅ Connected to MongoDB Atlas'))
+  .catch((err) => console.error('❌ MongoDB connection error:', err));
 
 // Import Google Gen AI SDK
 const { GoogleGenAI } = require('@google/genai');
+const Reminder = require('./models/Reminder');
 
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
@@ -56,14 +63,67 @@ async function handleEvent(event) {
   console.log('Received event:', JSON.stringify(event, null, 2));
 
   try {
-    // 1. 處理一般文字訊息 (一般 AI 聊天)
+    // 1. 處理一般文字訊息 (一般 AI 聊天或設定提醒)
     if (event.type === 'message' && event.message.type === 'text') {
+      const userText = event.message.text;
+      const now = new Date();
+      // 使用 Asia/Taipei 時區的字串，讓 Gemini 知道現在的台灣時間
+      const nowStr = now.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
+
+      const prompt = `使用者說了一句話：「${userText}」
+
+請判斷這句話是不是在要求「設定提醒事項」或「定時叫我做某事」。
+現在的台灣時間是：${nowStr}
+
+如果「是」設定提醒，請你推算出精確的觸發時間 (triggerTime)，推算邏輯請以台灣時間為準，並回傳一個合法的 JSON 格式，不要有其他任何前後文、Markdown 語法或解釋。格式必須嚴格如下：
+{
+  "isReminder": true,
+  "task": "提醒的具體事情（例如：回診打疫苗）",
+  "triggerTime": "ISO 8601 格式的 UTC 時間字串（例如：2024-05-15T12:00:00.000Z，請記得從台灣時間轉換成 UTC）"
+}
+
+如果「不是」設定提醒（例如一般聊天、問問題），請根據你作為 AI 助理的身分，直接用平易近人的繁體中文回覆他的對話。`;
+
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
-        contents: event.message.text,
+        contents: prompt,
       });
 
-      return await client.replyMessage(event.replyToken, { type: 'text', text: response.text });
+      let responseText = response.text.trim();
+      let isJson = false;
+      let reminderData = null;
+
+      // 嘗試解析是否為 JSON
+      try {
+        const jsonStr = responseText.replace(/^\`\`\`json/m, '').replace(/\`\`\`$/m, '').trim();
+        if (jsonStr.startsWith('{')) {
+          reminderData = JSON.parse(jsonStr);
+          if (reminderData.isReminder === true) {
+            isJson = true;
+          }
+        }
+      } catch (e) {
+        // 解析失敗，當作一般回覆
+      }
+
+      if (isJson && reminderData) {
+        // 寫入 MongoDB
+        const newReminder = new Reminder({
+          userId: event.source.userId,
+          task: reminderData.task,
+          triggerTime: new Date(reminderData.triggerTime)
+        });
+        await newReminder.save();
+
+        const localTime = new Date(reminderData.triggerTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
+        return await client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: `✅ 幫您記下來了！\n\n我會在 ${localTime} 提醒您：\n👉 ${reminderData.task}`
+        });
+      } else {
+        // 一般聊天回覆
+        return await client.replyMessage(event.replyToken, { type: 'text', text: responseText });
+      }
     }
 
     // 2. 處理語音訊息 (彈出快速回覆選單)
@@ -78,7 +138,7 @@ async function handleEvent(event) {
               action: {
                 type: 'postback',
                 label: '✨ 幫我潤飾',
-                data: `action=polish&msgId=${event.message.id}`,
+                data: `action = polish & msgId=${event.message.id}`,
                 displayText: '請幫我潤飾這段語音'
               }
             },
@@ -87,7 +147,7 @@ async function handleEvent(event) {
               action: {
                 type: 'postback',
                 label: '🔤 翻譯英文',
-                data: `action=translate&msgId=${event.message.id}`,
+                data: `action = translate & msgId=${event.message.id}`,
                 displayText: '請幫我將這段語音翻譯成英文'
               }
             }
@@ -167,6 +227,38 @@ async function handleEvent(event) {
     return Promise.resolve(null);
   }
 }
+
+const cron = require('node-cron');
+
+// 設定排程：每分鐘檢查一次過期且尚未通知的提醒
+cron.schedule('* * * * *', async () => {
+  try {
+    const now = new Date();
+    // 找出所有觸發時間小於等於現在，且尚未通知的提醒事項
+    const dueReminders = await Reminder.find({
+      triggerTime: { $lte: now },
+      isNotified: false
+    });
+
+    if (dueReminders.length > 0) {
+      console.log(`⏰ 找到 ${dueReminders.length} 筆需要發送的提醒`);
+
+      for (const reminder of dueReminders) {
+        // 主動推播訊息
+        await client.pushMessage(reminder.userId, {
+          type: 'text',
+          text: `⏰ 溫馨提醒：\n時間到囉！\n\n👉 ${reminder.task}`
+        });
+
+        // 推播成功後，更新標記
+        reminder.isNotified = true;
+        await reminder.save();
+      }
+    }
+  } catch (err) {
+    console.error('❌ 執行排程提醒發生錯誤:', err);
+  }
+});
 
 // listen on port
 const port = process.env.PORT || 3000;
