@@ -63,7 +63,7 @@ async function handleEvent(event) {
   console.log('Received event:', JSON.stringify(event, null, 2));
 
   try {
-    // 1. 處理一般文字訊息 (一般 AI 聊天或設定提醒)
+    // 1. 處理一般文字訊息 (一般 AI 聊天或設定/查詢/取消提醒)
     if (event.type === 'message' && event.message.type === 'text') {
       const userText = event.message.text;
       const now = new Date();
@@ -72,20 +72,40 @@ async function handleEvent(event) {
 
       const prompt = `使用者說了一句話：「${userText}」
 
-請判斷這句話是不是在要求「設定提醒事項」或「定時叫我做某事」。
-現在的台灣時間是：${nowStr}
+請分析這句話的意圖，判斷屬於以下哪一種操作。現在的台灣時間是：${nowStr}
 
-如果「是」設定提醒，請進一步判斷這是一個「單次提醒」還是「週期性提醒（例如：每週三晚上七點、每天早上八點）」。
-推算邏輯請以台灣時間為準，並回傳一個合法的 JSON 格式，不要有其他任何前後文、Markdown 語法或解釋。格式必須嚴格如下：
+【意圖 1：CREATE (建立提醒)】
+如果使用者要求「設定提醒事項」或「定時叫我做某事」，請進一步判斷這是一個「單次提醒」還是「週期性提醒（例如：每週三晚上七點、每天早上八點）」。
+推算邏輯請以台灣時間為準，並回傳以下嚴格的 JSON 格式：
 {
-  "isReminder": true,
+  "intent": "CREATE",
   "task": "提醒的具體事情（例如：回診打疫苗、去健身）",
-  "triggerTime": "ISO 8601 格式的 UTC 時間字串，代表『下一次』要觸發的時間（例如：2024-05-15T12:00:00.000Z，請記得從台灣時間轉換成 UTC）",
+  "triggerTime": "ISO 8601 格式的 UTC 時間字串，代表『下一次』要觸發的時間（例如：2024-05-15T12:00:00.000Z，需轉成 UTC）",
   "isRecurring": true 或 false,
-  "cronExpression": "如果是週期性提醒，請提供標準的 cron 表示式字串 (分 時 日 月 星期)，並請注意 cron 的時區是以 UTC 為準計算！例如台灣時間(UTC+8)的每天早上8點，cron 就是 '0 0 * * *'。如果不是週期性提醒，請填 null"
+  "cronExpression": "如果是週期性提醒，提供標準的 cron 表示式字串(分 時 日 月 星期)，時區以 UTC 計算。若非週期性請填 null"
 }
 
-如果「不是」設定提醒（例如一般聊天、問問題），請根據你作為 AI 助理的身分，直接用平易近人的繁體中文回覆他的對話。`;
+【意圖 2：QUERY (查詢提醒)】
+如果使用者詢問接下來有哪些提醒（例如：「本週有哪些提醒」、「我有設定什麼提醒嗎」），請回傳以下 JSON 格式：
+{
+  "intent": "QUERY"
+}
+
+【意圖 3：CANCEL (取消提醒)】
+如果使用者要求取消某個現有的提醒（例如：「取消下週三的健身」、「幫我把喝水提醒關掉」），請萃取出他想要取消的目標關鍵字，並回傳以下 JSON 格式：
+{
+  "intent": "CANCEL",
+  "cancelTarget": "使用者想取消的任務關鍵字（例如：健身、喝水）"
+}
+
+【意圖 4：CHAT (一般聊天)】
+如果是以上皆非的一般聊天或問問題，請嚴格回傳以下 JSON 格式：
+{
+  "intent": "CHAT",
+  "replyText": "你作為 AI 助理的平易近人繁體中文回覆內容"
+}
+
+請務必只回傳合法的 JSON 字串，不要有其他任何前後文、Markdown 語法或解釋。`;
 
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
@@ -93,42 +113,85 @@ async function handleEvent(event) {
       });
 
       let responseText = response.text.trim();
-      let isJson = false;
-      let reminderData = null;
+      let parsedData = null;
 
-      // 嘗試解析是否為 JSON
+      // 嘗試解析 JSON
       try {
         const jsonStr = responseText.replace(/^\`\`\`json/m, '').replace(/\`\`\`$/m, '').trim();
         if (jsonStr.startsWith('{')) {
-          reminderData = JSON.parse(jsonStr);
-          if (reminderData.isReminder === true) {
-            isJson = true;
-          }
+          parsedData = JSON.parse(jsonStr);
         }
       } catch (e) {
         // 解析失敗，當作一般回覆
-      }
-
-      if (isJson && reminderData) {
-        // 寫入 MongoDB
-        const newReminder = new Reminder({
-          userId: event.source.userId,
-          task: reminderData.task,
-          triggerTime: new Date(reminderData.triggerTime),
-          isRecurring: reminderData.isRecurring || false,
-          cronExpression: reminderData.cronExpression || undefined
-        });
-        await newReminder.save();
-
-        const localTime = new Date(reminderData.triggerTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
-        return await client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: `✅ 幫您記下來了！\n\n我會在 ${localTime} 提醒您：\n👉 ${reminderData.task}`
-        });
-      } else {
-        // 一般聊天回覆
         return await client.replyMessage(event.replyToken, { type: 'text', text: responseText });
       }
+
+      if (parsedData) {
+        if (parsedData.intent === 'CREATE') {
+          // 寫入 MongoDB
+          const newReminder = new Reminder({
+            userId: event.source.userId,
+            task: parsedData.task,
+            triggerTime: new Date(parsedData.triggerTime),
+            isRecurring: parsedData.isRecurring || false,
+            cronExpression: parsedData.cronExpression || undefined
+          });
+          await newReminder.save();
+
+          const localTime = new Date(parsedData.triggerTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
+          return await client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: `✅ 幫您記下來了！\n\n我會在 ${localTime} 提醒您：\n👉 ${parsedData.task}`
+          });
+        }
+        else if (parsedData.intent === 'QUERY') {
+          // 查詢本週提醒 (未來 7 天內)
+          const start = new Date();
+          const end = new Date();
+          end.setDate(end.getDate() + 7);
+
+          const reminders = await Reminder.find({
+            userId: event.source.userId,
+            isNotified: false,
+            triggerTime: { $gte: start, $lte: end }
+          }).sort({ triggerTime: 1 });
+
+          if (reminders.length === 0) {
+            return await client.replyMessage(event.replyToken, { type: 'text', text: '📅 未來七天內，您目前沒有任何已設定的提醒事項喔！' });
+          }
+
+          let replyStr = '📅 【未來七天提醒事項】\n\n';
+          reminders.forEach((r, index) => {
+            const timeStr = new Date(r.triggerTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
+            const recurStr = r.isRecurring ? ' (🔄週期)' : '';
+            replyStr += `${index + 1}. ${timeStr}\n👉 ${r.task}${recurStr}\n\n`;
+          });
+
+          return await client.replyMessage(event.replyToken, { type: 'text', text: replyStr.trim() });
+        }
+        else if (parsedData.intent === 'CANCEL' && parsedData.cancelTarget) {
+          // 取消提醒 (尋找 task 包含關鍵字的)
+          const targetRegex = new RegExp(parsedData.cancelTarget, 'i');
+          const deletedResult = await Reminder.deleteMany({
+            userId: event.source.userId,
+            isNotified: false,
+            task: { $regex: targetRegex }
+          });
+
+          if (deletedResult.deletedCount > 0) {
+            return await client.replyMessage(event.replyToken, { type: 'text', text: `🗑️ 已經為您取消了 ${deletedResult.deletedCount} 筆與「${parsedData.cancelTarget}」相關的提醒。` });
+          } else {
+            return await client.replyMessage(event.replyToken, { type: 'text', text: `👀 找不到與「${parsedData.cancelTarget}」相關的有效提醒喔！您可以先查詢目前的提醒清單再試試看。` });
+          }
+        }
+        else if (parsedData.intent === 'CHAT' && parsedData.replyText) {
+          // 一般聊天回覆
+          return await client.replyMessage(event.replyToken, { type: 'text', text: parsedData.replyText });
+        }
+      }
+
+      // Fallback
+      return await client.replyMessage(event.replyToken, { type: 'text', text: '抱歉，我不太懂您的意思，請再說一次。' });
     }
 
     // 2. 處理語音訊息 (彈出快速回覆選單)
