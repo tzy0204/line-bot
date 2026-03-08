@@ -85,7 +85,7 @@ async function handleEvent(event) {
         if (option === 'lite') {
           newModel = 'gemini-3.1-flash-lite-preview';
         } else if (option === 'flash') {
-          newModel = 'gemini-3.1-flash';
+          newModel = 'gemini-2.5-flash'; // 恢復為支援的 2.5 flash
         } else {
           return await client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 無效的選項，請使用 /model lite 或 /model flash' });
         }
@@ -94,7 +94,7 @@ async function handleEvent(event) {
         await UserSetting.findOneAndUpdate(
           { userId: event.source.userId },
           { preferredModel: newModel },
-          { upsert: true, new: true }
+          { upsert: true, returnDocument: 'after' }
         );
 
         return await client.replyMessage(event.replyToken, {
