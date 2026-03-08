@@ -85,7 +85,7 @@ async function handleEvent(event) {
         if (option === 'lite') {
           newModel = 'gemini-3.1-flash-lite-preview';
         } else if (option === 'flash') {
-          newModel = 'gemini-2.5-flash'; // 恢復為支援的 2.5 flash
+          newModel = 'gemini-3-flash-preview'; // 使用 3 的預覽版
         } else {
           return await client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 無效的選項，請使用 /model lite 或 /model flash' });
         }
