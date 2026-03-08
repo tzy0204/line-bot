@@ -64,38 +64,6 @@ async function handleEvent(event) {
   console.log('Received event:', JSON.stringify(event, null, 2));
 
   try {
-    // 0. 處理加入好友事件 (Welcome Message)
-    if (event.type === 'follow') {
-      const welcomeText = `👋 歡迎加入！我是你的專屬全能 AI 助理。
-
-我可以幫你處理以下三種主要任務，讓你生活更有效率：
-
-🗣️ 1. 語音潤飾與翻譯
-直接對我傳送「語音訊息」，我能聽懂你的意思並濾除冗言贅字，整理成通順的【中文逐字稿】，或是流暢的【英文翻譯】喔！
-
-⏰ 2. 智慧提醒事項（支援週期排程）
-直接用白話文吩咐我，例如：
-「下週三晚上七點提醒我去健身」
-「以後每天早上九點提醒我喝水」
-「查詢本週有哪些提醒」
-「幫我取消喝水提醒」
-
-💬 3. 萬能 AI 聊天
-不設鬧鐘時，我就是你的聰明大腦。有任何問題想問、想跟我聊聊，隨時打字給我！
-
-💡 [進階技巧] 
-預設情況下我會根據任務自動選擇最適用的 AI 模型。如果你想手動調整：
-輸入 /model lite (切換至省流日常模式) 
-輸入 /model flash (切換至高智商分析模式)
-
-趕快丟個語音給我，或是設定第一個提醒試試看吧！`;
-
-      return await client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: welcomeText
-      });
-    }
-
     // 1. 處理一般文字訊息 (一般 AI 聊天或設定/查詢/取消提醒)
     if (event.type === 'message' && event.message.type === 'text') {
       const userText = event.message.text.trim();
