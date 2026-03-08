@@ -206,7 +206,7 @@ async function handleEvent(event) {
               action: {
                 type: 'postback',
                 label: '✨ 幫我潤飾',
-                data: `action = polish & msgId=${event.message.id}`,
+                data: `action=polish&msgId=${event.message.id}`,
                 displayText: '請幫我潤飾這段語音'
               }
             },
@@ -215,7 +215,7 @@ async function handleEvent(event) {
               action: {
                 type: 'postback',
                 label: '🔤 翻譯英文',
-                data: `action = translate & msgId=${event.message.id}`,
+                data: `action=translate&msgId=${event.message.id}`,
                 displayText: '請幫我將這段語音翻譯成英文'
               }
             }
