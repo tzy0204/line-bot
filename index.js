@@ -236,7 +236,47 @@ async function handleEvent(event) {
       return await client.replyMessage(event.replyToken, { type: 'text', text: '抱歉，我不太懂您的意思，請再說一次。' });
     }
 
-    // 2. 處理語音訊息 (彈出快速回覆選單)
+    // 2. 處理圖片訊息 (請 Gemini 分析圖片)
+    if (event.type === 'message' && event.message.type === 'image') {
+      try {
+        // 從 LINE 伺服器下載圖片檔案
+        const stream = await client.getMessageContent(event.message.id);
+        const chunks = [];
+        for await (const chunk of stream) {
+          chunks.push(chunk);
+        }
+        const imageBuffer = Buffer.concat(chunks);
+        const base64Image = imageBuffer.toString('base64');
+
+        // 準備送給 Gemini 的 Prompt
+        const prompt = '請發揮你身為頂尖 AI 的觀察力，詳細地用繁體中文描述這張圖片裡有什麼？請用自然、友善的語氣。';
+
+        // 查詢用戶設定的偏好模型 (圖片分析偏向複雜理解，預設使用 3-flash-preview)
+        const userSetting = await UserSetting.findOne({ userId: event.source.userId });
+        const targetModel = userSetting ? userSetting.preferredModel : 'gemini-3-flash-preview';
+
+        // 傳送給 Gemini 處理
+        const response = await ai.models.generateContent({
+          model: targetModel,
+          contents: [
+            prompt,
+            {
+              inlineData: {
+                data: base64Image,
+                mimeType: 'image/jpeg' // LINE 回傳的圖片大部分為 jpeg
+              }
+            }
+          ]
+        });
+
+        return await client.replyMessage(event.replyToken, { type: 'text', text: response.text });
+      } catch (err) {
+        console.error('處理圖片失敗:', err);
+        return await client.replyMessage(event.replyToken, { type: 'text', text: '抱歉，我在「看」這張圖片時睜不開眼睛，處理發生了一點錯誤。' });
+      }
+    }
+
+    // 3. 處理語音訊息 (彈出快速回覆選單)
     if (event.type === 'message' && event.message.type === 'audio') {
       return await client.replyMessage(event.replyToken, {
         type: 'text',
@@ -266,7 +306,7 @@ async function handleEvent(event) {
       });
     }
 
-    // 3. 處理使用者點擊快速回覆的事件 (進行語音處理)
+    // 4. 處理使用者點擊快速回覆的事件 (進行語音處理)
     if (event.type === 'postback' && event.postback.data) {
       const data = new URLSearchParams(event.postback.data);
       const action = data.get('action');
