@@ -144,7 +144,7 @@ async function handleEvent(event) {
 
 請務必只回傳合法的 JSON 字串，不要有其他任何前後文、Markdown 語法或解釋。`;
 
-      // 查詢用戶設定，決定要使用的模型
+      // 查詢用戶設定，決定要使用的模型 (如果沒設定，一般文字意圖預設使用最省資源的 lite-preview)
       const userSetting = await UserSetting.findOne({ userId: event.source.userId });
       const targetModel = userSetting ? userSetting.preferredModel : 'gemini-3.1-flash-lite-preview';
 
@@ -296,9 +296,9 @@ async function handleEvent(event) {
           3. 將零碎的語句重新調整，組成通順且邏輯連貫的英文句子。
           4. 最後再精煉並潤飾文字，使其讀起來非常自然流暢，直接輸出最終的英文翻譯結果即可，不要包含任何解釋或多餘的回覆。`;
 
-        // 查詢用戶設定的偏好模型
+        // 查詢用戶設定的偏好模型 (如果沒設定，語音潤飾預設使用更聰明的 3-flash-preview)
         const userSetting = await UserSetting.findOne({ userId: event.source.userId });
-        const targetModel = userSetting ? userSetting.preferredModel : 'gemini-3.1-flash-lite-preview';
+        const targetModel = userSetting ? userSetting.preferredModel : 'gemini-3-flash-preview';
 
         // 傳送給 Gemini 處理
         const response = await ai.models.generateContent({
