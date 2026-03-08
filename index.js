@@ -2,6 +2,8 @@ const express = require('express');
 const line = require('@line/bot-sdk');
 require('dotenv').config();
 const mongoose = require('mongoose');
+const Reminder = require('./models/Reminder');
+const UserSetting = require('./models/UserSetting');
 
 // Connect to MongoDB
 mongoose.connect(process.env.MONGODB_URI)
@@ -10,7 +12,6 @@ mongoose.connect(process.env.MONGODB_URI)
 
 // Import Google Gen AI SDK
 const { GoogleGenAI } = require('@google/genai');
-const Reminder = require('./models/Reminder');
 
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
@@ -62,10 +63,46 @@ app.post('/webhook', line.middleware(config), (req, res) => {
 async function handleEvent(event) {
   console.log('Received event:', JSON.stringify(event, null, 2));
 
-  try {
-    // 1. 處理一般文字訊息 (一般 AI 聊天或設定/查詢/取消提醒)
+  try {  // 1. 處理一般文字訊息 (一般 AI 聊天或設定/查詢/取消提醒)
     if (event.type === 'message' && event.message.type === 'text') {
-      const userText = event.message.text;
+      const userText = event.message.text.trim();
+
+      // 處理 /model 指令
+      if (userText.startsWith('/model')) {
+        const args = userText.split(' ');
+        const option = args[1] ? args[1].toLowerCase() : null;
+
+        if (!option) {
+          const setting = await UserSetting.findOne({ userId: event.source.userId });
+          const currentModel = setting ? setting.preferredModel : 'gemini-3.1-flash-lite-preview';
+          return await client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: `🤖 目前使用的 AI 模型為：${currentModel}\n你可以輸入 /model lite 或 /model flash 來切換。`
+          });
+        }
+
+        let newModel = '';
+        if (option === 'lite') {
+          newModel = 'gemini-3.1-flash-lite-preview';
+        } else if (option === 'flash') {
+          newModel = 'gemini-3.1-flash';
+        } else {
+          return await client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 無效的選項，請使用 /model lite 或 /model flash' });
+        }
+
+        // 更新或建立設定
+        await UserSetting.findOneAndUpdate(
+          { userId: event.source.userId },
+          { preferredModel: newModel },
+          { upsert: true, new: true }
+        );
+
+        return await client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: `✅ 已成功為你切換至 ${newModel} 模型！`
+        });
+      }
+
       const now = new Date();
       // 使用 Asia/Taipei 時區的字串，讓 Gemini 知道現在的台灣時間
       const nowStr = now.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
@@ -107,8 +144,12 @@ async function handleEvent(event) {
 
 請務必只回傳合法的 JSON 字串，不要有其他任何前後文、Markdown 語法或解釋。`;
 
+      // 查詢用戶設定，決定要使用的模型
+      const userSetting = await UserSetting.findOne({ userId: event.source.userId });
+      const targetModel = userSetting ? userSetting.preferredModel : 'gemini-3.1-flash-lite-preview';
+
       const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite-preview',
+        model: targetModel,
         contents: prompt,
       });
 
@@ -255,9 +296,13 @@ async function handleEvent(event) {
           3. 將零碎的語句重新調整，組成通順且邏輯連貫的英文句子。
           4. 最後再精煉並潤飾文字，使其讀起來非常自然流暢，直接輸出最終的英文翻譯結果即可，不要包含任何解釋或多餘的回覆。`;
 
+        // 查詢用戶設定的偏好模型
+        const userSetting = await UserSetting.findOne({ userId: event.source.userId });
+        const targetModel = userSetting ? userSetting.preferredModel : 'gemini-3.1-flash-lite-preview';
+
         // 傳送給 Gemini 處理
         const response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite-preview',
+          model: targetModel,
           contents: [
             prompt,
             {
