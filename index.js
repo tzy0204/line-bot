@@ -1,14 +1,18 @@
 const express = require('express');
 const line = require('@line/bot-sdk');
 require('dotenv').config();
-const mongoose = require('mongoose');
-const Reminder = require('./models/Reminder');
-const UserSetting = require('./models/UserSetting');
+const { createClient } = require('@supabase/supabase-js');
 
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('✅ Connected to MongoDB Atlas'))
-  .catch((err) => console.error('❌ MongoDB connection error:', err));
+// Initialize Supabase client
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error('❌ Missing SUPABASE_URL or SUPABASE_KEY. Please set them in your .env file or Render dashboard.');
+  process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Import Google Gen AI SDK
 const { GoogleGenAI } = require('@google/genai');
@@ -74,8 +78,13 @@ async function handleEvent(event) {
         const option = args[1] ? args[1].toLowerCase() : null;
 
         if (!option) {
-          const setting = await UserSetting.findOne({ userId: event.source.userId });
-          const currentModel = setting ? setting.preferredModel : 'gemini-3.1-flash-lite-preview';
+          const { data: user } = await supabase
+            .from('users')
+            .select('selected_model')
+            .eq('line_user_id', event.source.userId)
+            .single();
+
+          const currentModel = user?.selected_model || 'gemini-3.1-flash-lite-preview';
           return await client.replyMessage(event.replyToken, {
             type: 'text',
             text: `🤖 目前使用的 AI 模型為：${currentModel}\n你可以輸入 /model lite 或 /model flash 來切換。`
@@ -91,12 +100,18 @@ async function handleEvent(event) {
           return await client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 無效的選項，請使用 /model lite 或 /model flash' });
         }
 
-        // 更新或建立設定
-        await UserSetting.findOneAndUpdate(
-          { userId: event.source.userId },
-          { preferredModel: newModel },
-          { upsert: true, returnDocument: 'after' }
-        );
+        // 確保 User 存在，並更新偏好模型 (Upsert)
+        const { error: upsertError } = await supabase
+          .from('users')
+          .upsert(
+            { line_user_id: event.source.userId, selected_model: newModel },
+            { onConflict: 'line_user_id' }
+          );
+
+        if (upsertError) {
+          console.error('Error updating user model:', upsertError);
+          return await client.replyMessage(event.replyToken, { type: 'text', text: '❌ 儲存模型設定失敗，請稍後再試。' });
+        }
 
         return await client.replyMessage(event.replyToken, {
           type: 'text',
@@ -146,8 +161,13 @@ async function handleEvent(event) {
 請務必只回傳合法的 JSON 字串，不要有其他任何前後文、Markdown 語法或解釋。`;
 
       // 查詢用戶設定，決定要使用的模型 (如果沒設定，一般文字意圖預設使用最省資源的 lite-preview)
-      const userSetting = await UserSetting.findOne({ userId: event.source.userId });
-      const targetModel = userSetting ? userSetting.preferredModel : 'gemini-3.1-flash-lite-preview';
+      const { data: userSetting } = await supabase
+        .from('users')
+        .select('selected_model')
+        .eq('line_user_id', event.source.userId)
+        .single();
+
+      const targetModel = userSetting?.selected_model || 'gemini-3.1-flash-lite-preview';
 
       const response = await ai.models.generateContent({
         model: targetModel,
@@ -170,15 +190,25 @@ async function handleEvent(event) {
 
       if (parsedData) {
         if (parsedData.intent === 'CREATE') {
-          // 寫入 MongoDB
-          const newReminder = new Reminder({
-            userId: event.source.userId,
+          // 因為提醒關聯 user，所以先確保使用者存在
+          await supabase.from('users').upsert(
+            { line_user_id: event.source.userId },
+            { onConflict: 'line_user_id', ignoreDuplicates: true }
+          );
+
+          // 寫入 Supabase reminders table
+          const { error: insertError } = await supabase.from('reminders').insert([{
+            line_user_id: event.source.userId,
             task: parsedData.task,
-            triggerTime: new Date(parsedData.triggerTime),
-            isRecurring: parsedData.isRecurring || false,
-            cronExpression: parsedData.cronExpression || undefined
-          });
-          await newReminder.save();
+            trigger_time: new Date(parsedData.triggerTime).toISOString(),
+            is_recurring: parsedData.isRecurring || false,
+            cron_expression: parsedData.cronExpression || null
+          }]);
+
+          if (insertError) {
+            console.error('Insert reminder error:', insertError);
+            return await client.replyMessage(event.replyToken, { type: 'text', text: '😭 儲存提醒發生錯誤，請稍後再試。' });
+          }
 
           const localTime = new Date(parsedData.triggerTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
           return await client.replyMessage(event.replyToken, {
@@ -192,36 +222,40 @@ async function handleEvent(event) {
           const end = new Date();
           end.setDate(end.getDate() + 7);
 
-          const reminders = await Reminder.find({
-            userId: event.source.userId,
-            isNotified: false,
-            triggerTime: { $gte: start, $lte: end }
-          }).sort({ triggerTime: 1 });
+          const { data: reminders, error: queryError } = await supabase
+            .from('reminders')
+            .select('*')
+            .eq('line_user_id', event.source.userId)
+            .eq('is_notified', false)
+            .gte('trigger_time', start.toISOString())
+            .lte('trigger_time', end.toISOString())
+            .order('trigger_time', { ascending: true });
 
-          if (reminders.length === 0) {
+          if (queryError || !reminders || reminders.length === 0) {
             return await client.replyMessage(event.replyToken, { type: 'text', text: '📅 未來七天內，您目前沒有任何已設定的提醒事項喔！' });
           }
 
           let replyStr = '📅 【未來七天提醒事項】\n\n';
           reminders.forEach((r, index) => {
-            const timeStr = new Date(r.triggerTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
-            const recurStr = r.isRecurring ? ' (🔄週期)' : '';
+            const timeStr = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
+            const recurStr = r.is_recurring ? ' (🔄週期)' : '';
             replyStr += `${index + 1}. ${timeStr}\n👉 ${r.task}${recurStr}\n\n`;
           });
 
           return await client.replyMessage(event.replyToken, { type: 'text', text: replyStr.trim() });
         }
         else if (parsedData.intent === 'CANCEL' && parsedData.cancelTarget) {
-          // 取消提醒 (尋找 task 包含關鍵字的)
-          const targetRegex = new RegExp(parsedData.cancelTarget, 'i');
-          const deletedResult = await Reminder.deleteMany({
-            userId: event.source.userId,
-            isNotified: false,
-            task: { $regex: targetRegex }
-          });
+          // 取消提醒 (Supabase text search: ilike '%' || keyword || '%')
+          const { data: deletedResult, error: deleteError } = await supabase
+            .from('reminders')
+            .delete()
+            .eq('line_user_id', event.source.userId)
+            .eq('is_notified', false)
+            .ilike('task', `%${parsedData.cancelTarget}%`)
+            .select(); // 取得被刪除的筆數
 
-          if (deletedResult.deletedCount > 0) {
-            return await client.replyMessage(event.replyToken, { type: 'text', text: `🗑️ 已經為您取消了 ${deletedResult.deletedCount} 筆與「${parsedData.cancelTarget}」相關的提醒。` });
+          if (!deleteError && deletedResult && deletedResult.length > 0) {
+            return await client.replyMessage(event.replyToken, { type: 'text', text: `🗑️ 已經為您取消了 ${deletedResult.length} 筆與「${parsedData.cancelTarget}」相關的提醒。` });
           } else {
             return await client.replyMessage(event.replyToken, { type: 'text', text: `👀 找不到與「${parsedData.cancelTarget}」相關的有效提醒喔！您可以先查詢目前的提醒清單再試試看。` });
           }
@@ -252,8 +286,12 @@ async function handleEvent(event) {
         const prompt = '請發揮你身為頂尖 AI 的觀察力，詳細地用繁體中文描述這張圖片裡有什麼？請用自然、友善的語氣。';
 
         // 查詢用戶設定的偏好模型 (圖片分析偏向複雜理解，預設使用 3-flash-preview)
-        const userSetting = await UserSetting.findOne({ userId: event.source.userId });
-        const targetModel = userSetting ? userSetting.preferredModel : 'gemini-3-flash-preview';
+        const { data: userSetting } = await supabase
+          .from('users')
+          .select('selected_model')
+          .eq('line_user_id', event.source.userId)
+          .single();
+        const targetModel = userSetting?.selected_model || 'gemini-3-flash-preview';
 
         // 傳送給 Gemini 處理
         const response = await ai.models.generateContent({
@@ -338,8 +376,12 @@ async function handleEvent(event) {
           4. 最後再精煉並潤飾文字，使其讀起來非常自然流暢，直接輸出最終的英文翻譯結果即可，不要包含任何解釋或多餘的回覆。`;
 
         // 查詢用戶設定的偏好模型 (如果沒設定，語音潤飾預設使用更聰明的 3-flash-preview)
-        const userSetting = await UserSetting.findOne({ userId: event.source.userId });
-        const targetModel = userSetting ? userSetting.preferredModel : 'gemini-3-flash-preview';
+        const { data: userSetting } = await supabase
+          .from('users')
+          .select('selected_model')
+          .eq('line_user_id', event.source.userId)
+          .single();
+        const targetModel = userSetting?.selected_model || 'gemini-3-flash-preview';
 
         // 傳送給 Gemini 處理
         const response = await ai.models.generateContent({
@@ -390,40 +432,56 @@ cron.schedule('* * * * *', async () => {
   try {
     const now = new Date();
     // 找出所有觸發時間小於等於現在，且尚未通知的提醒事項
-    const dueReminders = await Reminder.find({
-      triggerTime: { $lte: now },
-      isNotified: false
-    });
+    const { data: dueReminders, error: fetchError } = await supabase
+      .from('reminders')
+      .select('*')
+      .lte('trigger_time', now.toISOString())
+      .eq('is_notified', false);
 
-    if (dueReminders.length > 0) {
+    if (fetchError) {
+      console.error('Cron fetch reminders error:', fetchError);
+      return;
+    }
+
+    if (dueReminders && dueReminders.length > 0) {
       console.log(`⏰ 找到 ${dueReminders.length} 筆需要發送的提醒`);
 
       for (const reminder of dueReminders) {
         // 主動推播訊息
-        await client.pushMessage(reminder.userId, {
+        await client.pushMessage(reminder.line_user_id, {
           type: 'text',
           text: `⏰ 溫馨提醒：\n時間到囉！\n\n👉 ${reminder.task}`
         });
 
-        if (reminder.isRecurring && reminder.cronExpression) {
+        let updatePayload = {};
+
+        if (reminder.is_recurring && reminder.cron_expression) {
           // 如果是週期性提醒，算出下一次的時間，並更新 triggerTime
           try {
-            const interval = cronParser.parseExpression(reminder.cronExpression, {
+            const interval = cronParser.parseExpression(reminder.cron_expression, {
               currentDate: new Date(), // 以現在時間為基準算下一次
               tz: 'UTC' // 確保內部運算用 UTC 與資料庫一致
             });
-            reminder.triggerTime = interval.next().toDate();
-            console.log(`🔄 週期性提醒已重新排程於：${reminder.triggerTime}`);
+            updatePayload.trigger_time = interval.next().toDate().toISOString();
+            console.log(`🔄 週期性提醒已重新排程於：${updatePayload.trigger_time}`);
           } catch (err) {
             console.error('❌ 解析 cronExpression 失敗，改為單次提醒:', err);
-            reminder.isNotified = true;
+            updatePayload.is_notified = true;
           }
         } else {
           // 單次提醒，標記為已發送
-          reminder.isNotified = true;
+          updatePayload.is_notified = true;
         }
 
-        await reminder.save();
+        // 寫入回資料庫
+        const { error: updateError } = await supabase
+          .from('reminders')
+          .update(updatePayload)
+          .eq('id', reminder.id);
+
+        if (updateError) {
+          console.error(`Failed to update reminder ${reminder.id}:`, updateError);
+        }
       }
     }
   } catch (err) {
