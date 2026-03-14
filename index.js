@@ -238,9 +238,12 @@ async function handleEvent(event) {
             .single();
 
           const currentModel = user?.selected_model || 'gemini-3.1-flash-lite-preview';
-          return await client.replyMessage(event.replyToken, {
-            type: 'text',
-            text: `🤖 目前使用的 AI 模型為：${currentModel}\n你可以輸入 /model lite 或 /model flash 來切換。`
+          return await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{
+              type: 'text',
+              text: `🤖 目前使用的 AI 模型為：${currentModel}\n你可以輸入 /model lite 或 /model flash 來切換。`
+            }]
           });
         }
 
@@ -250,7 +253,7 @@ async function handleEvent(event) {
         } else if (option === 'flash') {
           newModel = 'gemini-3-flash-preview'; // 使用 3 的預覽版
         } else {
-          return await client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 無效的選項，請使用 /model lite 或 /model flash' });
+          return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '⚠️ 無效的選項，請使用 /model lite 或 /model flash' }] });
         }
 
         // 確保 User 存在，並更新偏好模型 (Upsert)
@@ -263,12 +266,15 @@ async function handleEvent(event) {
 
         if (upsertError) {
           console.error('Error updating user model:', upsertError);
-          return await client.replyMessage(event.replyToken, { type: 'text', text: '❌ 儲存模型設定失敗，請稍後再試。' });
+          return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '❌ 儲存模型設定失敗，請稍後再試。' }] });
         }
 
-        return await client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: `✅ 已成功為你切換至 ${newModel} 模型！`
+        return await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{
+            type: 'text',
+            text: `✅ 已成功為你切換至 ${newModel} 模型！`
+          }]
         });
       }
 
@@ -337,7 +343,7 @@ async function handleEvent(event) {
         }
       } catch (e) {
         // 解析失敗，當作一般回覆
-        return await client.replyMessage(event.replyToken, { type: 'text', text: responseText });
+        return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: responseText }] });
       }
 
       if (parsedData) {
@@ -359,13 +365,16 @@ async function handleEvent(event) {
 
           if (insertError) {
             console.error('Insert reminder error:', insertError);
-            return await client.replyMessage(event.replyToken, { type: 'text', text: '😭 儲存提醒發生錯誤，請稍後再試。' });
+            return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '😭 儲存提醒發生錯誤，請稍後再試。' }] });
           }
 
           const localTime = new Date(parsedData.triggerTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
-          return await client.replyMessage(event.replyToken, {
-            type: 'text',
-            text: `✅ 幫您記下來了！\n\n我會在 ${localTime} 提醒您：\n👉 ${parsedData.task}`
+          return await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{
+              type: 'text',
+              text: `✅ 幫您記下來了！\n\n我會在 ${localTime} 提醒您：\n👉 ${parsedData.task}`
+            }]
           });
         }
         else if (parsedData.intent === 'QUERY') {
@@ -384,7 +393,7 @@ async function handleEvent(event) {
             .order('trigger_time', { ascending: true });
 
           if (queryError || !reminders || reminders.length === 0) {
-            return await client.replyMessage(event.replyToken, { type: 'text', text: '📅 未來七天內，您目前沒有任何已設定的提醒事項喔！' });
+            return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '📅 未來七天內，您目前沒有任何已設定的提醒事項喔！' }] });
           }
 
           let replyStr = '📅 【未來七天提醒事項】\n\n';
@@ -394,7 +403,7 @@ async function handleEvent(event) {
             replyStr += `${index + 1}. ${timeStr}\n👉 ${r.task}${recurStr}\n\n`;
           });
 
-          return await client.replyMessage(event.replyToken, { type: 'text', text: replyStr.trim() });
+          return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: replyStr.trim() }] });
         }
         else if (parsedData.intent === 'CANCEL' && parsedData.cancelTarget) {
           // 取消提醒 (Supabase text search: ilike '%' || keyword || '%')
@@ -407,9 +416,9 @@ async function handleEvent(event) {
             .select(); // 取得被刪除的筆數
 
           if (!deleteError && deletedResult && deletedResult.length > 0) {
-            return await client.replyMessage(event.replyToken, { type: 'text', text: `🗑️ 已經為您取消了 ${deletedResult.length} 筆與「${parsedData.cancelTarget}」相關的提醒。` });
+            return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `🗑️ 已經為您取消了 ${deletedResult.length} 筆與「${parsedData.cancelTarget}」相關的提醒。` }] });
           } else {
-            return await client.replyMessage(event.replyToken, { type: 'text', text: `👀 找不到與「${parsedData.cancelTarget}」相關的有效提醒喔！您可以先查詢目前的提醒清單再試試看。` });
+            return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `👀 找不到與「${parsedData.cancelTarget}」相關的有效提醒喔！您可以先查詢目前的提醒清單再試試看。` }] });
           }
         }
         else if (parsedData.intent === 'CHAT') {
@@ -480,18 +489,20 @@ async function handleEvent(event) {
             }
 
             // 將函數執行結果送回給模型，讓模型產出最終的文字回覆
-            chatResponse = await chat.sendMessage([{
-              functionResponse: { name: functionName, response: apiResponse }
-            }]);
+            chatResponse = await chat.sendMessage({
+              message: {
+                functionResponse: { name: functionName, response: apiResponse }
+              }
+            });
           }
 
           const replyText = chatResponse.text || '好的，我記下來了！';
-          return await client.replyMessage(event.replyToken, { type: 'text', text: replyText });
+          return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: replyText }] });
         }
       }
 
       // Fallback
-      return await client.replyMessage(event.replyToken, { type: 'text', text: '抱歉，我不太懂您的意思，請再說一次。' });
+      return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '抱歉，我不太懂您的意思，請再說一次。' }] });
     }
 
     // 2. 處理圖片訊息 (請 Gemini 分析圖片)
@@ -531,40 +542,43 @@ async function handleEvent(event) {
           ]
         });
 
-        return await client.replyMessage(event.replyToken, { type: 'text', text: response.text });
+        return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: response.text }] });
       } catch (err) {
         console.error('處理圖片失敗:', err);
-        return await client.replyMessage(event.replyToken, { type: 'text', text: '抱歉，我在「看」這張圖片時睜不開眼睛，處理發生了一點錯誤。' });
+        return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '抱歉，我在「看」這張圖片時睜不開眼睛，處理發生了一點錯誤。' }] });
       }
     }
 
     // 3. 處理語音訊息 (彈出快速回覆選單)
     if (event.type === 'message' && event.message.type === 'audio') {
-      return await client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: '收到語音！請選擇您希望我幫忙處理的方式：',
-        quickReply: {
-          items: [
-            {
-              type: 'action',
-              action: {
-                type: 'postback',
-                label: '✨ 幫我潤飾',
-                data: `action=polish&msgId=${event.message.id}`,
-                displayText: '請幫我潤飾這段語音'
+      return await client.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{
+          type: 'text',
+          text: '收到語音！請選擇您希望我幫忙處理的方式：',
+          quickReply: {
+            items: [
+              {
+                type: 'action',
+                action: {
+                  type: 'postback',
+                  label: '✨ 幫我潤飾',
+                  data: `action=polish&msgId=${event.message.id}`,
+                  displayText: '請幫我潤飾這段語音'
+                }
+              },
+              {
+                type: 'action',
+                action: {
+                  type: 'postback',
+                  label: '🔤 翻譯英文',
+                  data: `action=translate&msgId=${event.message.id}`,
+                  displayText: '請幫我將這段語音翻譯成英文'
+                }
               }
-            },
-            {
-              type: 'action',
-              action: {
-                type: 'postback',
-                label: '🔤 翻譯英文',
-                data: `action=translate&msgId=${event.message.id}`,
-                displayText: '請幫我將這段語音翻譯成英文'
-              }
-            }
-          ]
-        }
+            ]
+          }
+        }]
       });
     }
 
@@ -621,7 +635,7 @@ async function handleEvent(event) {
           ]
         });
 
-        return await client.replyMessage(event.replyToken, { type: 'text', text: response.text });
+        return await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: response.text }] });
       }
     }
 
@@ -636,9 +650,12 @@ async function handleEvent(event) {
 
     if (event.replyToken) {
       try {
-        return await client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: '抱歉，處理過程中發生了一點錯誤，請稍後再試。'
+        return await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{
+            type: 'text',
+            text: '抱歉，處理過程中發生了一點錯誤，請稍後再試。'
+          }]
         });
       } catch (fallbackError) {
         console.error('Fallback error:', fallbackError.message);
@@ -672,9 +689,12 @@ cron.schedule('* * * * *', async () => {
 
       for (const reminder of dueReminders) {
         // 主動推播訊息
-        await client.pushMessage(reminder.line_user_id, {
-          type: 'text',
-          text: `⏰ 溫馨提醒：\n時間到囉！\n\n👉 ${reminder.task}`
+        await client.pushMessage({
+          to: reminder.line_user_id,
+          messages: [{
+            type: 'text',
+            text: `⏰ 溫馨提醒：\n時間到囉！\n\n👉 ${reminder.task}`
+          }]
         });
 
         let updatePayload = {};
