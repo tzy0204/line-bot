@@ -1,5 +1,6 @@
 const express = require('express');
 const line = require('@line/bot-sdk');
+const { google } = require('googleapis');
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 
@@ -46,6 +47,158 @@ app.get('/wake-up', (req, res) => {
   console.log('⏰ [UptimeRobot] Ping received. Server is awake!');
   res.status(200).send('Awake');
 });
+
+// --- Google OAuth2 Setup ---
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
+
+// 產生授權連結的路由，帶上 LINE 用戶 ID
+app.get('/auth', (req, res) => {
+  const uid = req.query.uid;
+  if (!uid) {
+    return res.status(400).send('Missing line user id (uid).');
+  }
+
+  // 產生授權 URL，並將 uid 包裝在 state 參數中帶過去
+  const authUrl = oauth2Client.generateAuthUrl({
+    access_type: 'offline', // 需要 offline 才能取得 refresh_token
+    prompt: 'consent',      // 強制顯示授權畫面，確保一定會核發 refresh_token
+    scope: ['https://www.googleapis.com/auth/drive.file'],
+    state: uid              // 安全繼承 uid 狀態
+  });
+
+  res.redirect(authUrl);
+});
+
+// 接收 Google 授權成功後的回呼路由
+app.get('/oauth2callback', async (req, res) => {
+  const code = req.query.code;
+  const state = req.query.state; // 這是 LINE 用戶的 ID
+
+  if (!code || !state) {
+    return res.status(400).send('Authorization failed: code or state missing.');
+  }
+
+  try {
+    // 拿 code 換取 token
+    const { tokens } = await oauth2Client.getToken(code);
+
+    // 如果有拿到 refresh_token，就存進 Supabase
+    if (tokens.refresh_token) {
+      const { error } = await supabase
+        .from('users')
+        .upsert(
+          {
+            line_user_id: state,
+            google_refresh_token: tokens.refresh_token,
+            is_auth_completed: true
+          },
+          { onConflict: 'line_user_id' }
+        );
+
+      if (error) {
+        console.error('Failed to save refresh_token to Supabase:', error);
+        return res.status(500).send('Database error during authorization.');
+      }
+
+      console.log(`✅ OAuth successful for user ${state}`);
+
+      // 回覆一個簡單美觀的 HTML 成功頁面
+      res.send(`
+        <html>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <style>
+            body { font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; background-color: #f0fdf4; margin: 0; }
+            .card { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; }
+            h1 { color: #166534; }
+            p { color: #374151; font-size: 1.1rem; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>🎉 授權成功！</h1>
+            <p>您的專屬記憶庫已成功連結。</p>
+            <p>請關閉此網頁，回到 LINE 繼續對話。</p>
+          </div>
+        </body>
+        </html>
+      `);
+    } else {
+      res.status(400).send('No refresh token received. Please try unlinking the app from your Google account and authorizing again.');
+    }
+  } catch (error) {
+    console.error('Error in oauth2callback:', error);
+    res.status(500).send('Authentication Error');
+  }
+});
+
+// --- Google Drive Memory Helpers ---
+async function getDriveClient(refreshToken) {
+  const auth = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI
+  );
+  auth.setCredentials({ refresh_token: refreshToken });
+  return google.drive({ version: 'v3', auth });
+}
+
+async function getMemoryFileId(drive) {
+  const res = await drive.files.list({
+    q: "name='Gemini_Memory.md' and trashed=false",
+    spaces: 'drive',
+    fields: 'files(id, name)'
+  });
+  if (res.data.files && res.data.files.length > 0) {
+    return res.data.files[0].id;
+  }
+
+  // Create if not exists
+  console.log('Gemini_Memory.md not found, creating a new one...');
+  const fileMetadata = { name: 'Gemini_Memory.md', mimeType: 'text/markdown' };
+  const media = { mimeType: 'text/markdown', body: '# 專屬個人記憶庫\n\n' };
+  const file = await drive.files.create({ resource: fileMetadata, media: media, fields: 'id' });
+  return file.data.id;
+}
+
+const memoryFunctions = {
+  read_personal_memory: async ({ }, refreshToken) => {
+    try {
+      const drive = await getDriveClient(refreshToken);
+      const fileId = await getMemoryFileId(drive);
+      const res = await drive.files.get({ fileId: fileId, alt: 'media' }, { responseType: 'text' });
+      return { result: res.data || '目前記憶庫是空的。' };
+    } catch (e) {
+      console.error('Read memory error:', e.message);
+      return { error: '讀取記憶失敗' };
+    }
+  },
+  update_personal_memory: async ({ contentToAppend }, refreshToken) => {
+    try {
+      const drive = await getDriveClient(refreshToken);
+      const fileId = await getMemoryFileId(drive);
+      // Get current content first
+      const res = await drive.files.get({ fileId: fileId, alt: 'media' }, { responseType: 'text' });
+      const currentContent = res.data || '';
+
+      const timeStr = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
+      const newContent = currentContent + `\n- [${timeStr}] ${contentToAppend}`;
+
+      await drive.files.update({
+        fileId: fileId,
+        media: { mimeType: 'text/markdown', body: newContent }
+      });
+      return { result: '成功追加記憶至 Google Drive!' };
+    } catch (e) {
+      console.error('Update memory error:', e.message);
+      return { error: '更新記憶失敗' };
+    }
+  }
+};
 
 // register a webhook handler with middleware
 // about the middleware, please refer to doc
@@ -151,11 +304,10 @@ async function handleEvent(event) {
   "cancelTarget": "使用者想取消的任務關鍵字（例如：健身、喝水）"
 }
 
-【意圖 4：CHAT (一般聊天)】
-如果是以上皆非的一般聊天或問問題，請嚴格回傳以下 JSON 格式：
+【意圖 4：CHAT (一般聊天或記憶存取)】
+如果是以上皆非的日常聊天、問答，或者是對話涉及到過去的細節、需要查閱或追加入個人專屬記憶庫時，請嚴格回傳以下 JSON 格式：
 {
-  "intent": "CHAT",
-  "replyText": "你作為 AI 助理的平易近人繁體中文回覆內容"
+  "intent": "CHAT"
 }
 
 請務必只回傳合法的 JSON 字串，不要有其他任何前後文、Markdown 語法或解釋。`;
@@ -260,9 +412,81 @@ async function handleEvent(event) {
             return await client.replyMessage(event.replyToken, { type: 'text', text: `👀 找不到與「${parsedData.cancelTarget}」相關的有效提醒喔！您可以先查詢目前的提醒清單再試試看。` });
           }
         }
-        else if (parsedData.intent === 'CHAT' && parsedData.replyText) {
-          // 一般聊天回覆
-          return await client.replyMessage(event.replyToken, { type: 'text', text: parsedData.replyText });
+        else if (parsedData.intent === 'CHAT') {
+          // 一般聊天回覆與個人記憶庫功能 (Function Calling)
+
+          // 確認授權狀態
+          const { data: user } = await supabase
+            .from('users')
+            .select('google_refresh_token, is_auth_completed')
+            .eq('line_user_id', event.source.userId)
+            .single();
+
+          let systemInstruction = '';
+          let tools = undefined;
+
+          if (!user || !user.is_auth_completed || !user.google_refresh_token) {
+            const authUrl = `${process.env.GOOGLE_REDIRECT_URI.replace('/oauth2callback', '')}/auth?uid=${event.source.userId}`;
+            systemInstruction = `此用戶尚未授權 Google Drive。無法存取個人記憶。若對話中用戶有記憶需求，請主動且溫和地提供此授權連結請他點擊：${authUrl}`;
+          } else {
+            systemInstruction = `你可以使用功能呼叫 \`read_personal_memory\` 與 \`update_personal_memory\` 來管理使用者的專屬中長期記憶。遇到重要資訊時應主動摘要並儲存；被問及過去細節時主動讀取記憶。回答時如同朋友般親切自然。`;
+            tools = [{
+              functionDeclarations: [
+                {
+                  name: 'read_personal_memory',
+                  description: '讀取使用者的長期記憶檔案內容'
+                },
+                {
+                  name: 'update_personal_memory',
+                  description: '將對話中出現的全新或重要的資訊摘要並追加紀錄到使用者的長期記憶中',
+                  parameters: {
+                    type: 'OBJECT',
+                    properties: {
+                      contentToAppend: {
+                        type: 'STRING',
+                        description: '要追加儲存的記憶摘要內容（以條列重點的風格為主）'
+                      }
+                    },
+                    required: ['contentToAppend']
+                  }
+                }
+              ]
+            }];
+          }
+
+          const chatConfig = { systemInstruction };
+          if (tools) chatConfig.tools = tools;
+
+          const chat = ai.chats.create({
+            model: targetModel,
+            config: chatConfig
+          });
+
+          let chatResponse = await chat.sendMessage({ message: userText });
+
+          // 如果模型決定要呼叫 Function
+          if (chatResponse.functionCalls && chatResponse.functionCalls.length > 0) {
+            const call = chatResponse.functionCalls[0];
+            const functionName = call.name;
+            const functionArgs = call.args;
+
+            console.log(`Executing tool: ${functionName}`, functionArgs);
+
+            let apiResponse;
+            if (memoryFunctions[functionName] && user.google_refresh_token) {
+              apiResponse = await memoryFunctions[functionName](functionArgs, user.google_refresh_token);
+            } else {
+              apiResponse = { error: '未知的函數或尚未授權 Google' };
+            }
+
+            // 將函數執行結果送回給模型，讓模型產出最終的文字回覆
+            chatResponse = await chat.sendMessage([{
+              functionResponse: { name: functionName, response: apiResponse }
+            }]);
+          }
+
+          const replyText = chatResponse.text || '好的，我記下來了！';
+          return await client.replyMessage(event.replyToken, { type: 'text', text: replyText });
         }
       }
 
