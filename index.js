@@ -33,6 +33,10 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 // about Express itself: https://expressjs.com/
 const app = express();
 
+// Server status tracking
+let lastWakeUpTime = null;
+const serverStartTime = Date.now();
+
 // 設計一個受保護的喚醒端點
 app.get('/wake-up', (req, res) => {
   // 檢查請求中是否帶有正確的 token (?token=...)
@@ -45,6 +49,7 @@ app.get('/wake-up', (req, res) => {
 
   // Token 正確，印出 Log 並回傳 200 讓 UptimeRobot 知道伺服器活著
   console.log('⏰ [UptimeRobot] Ping received. Server is awake!');
+  lastWakeUpTime = new Date();
   res.status(200).send('Awake');
 });
 
@@ -136,6 +141,174 @@ app.get('/oauth2callback', async (req, res) => {
   }
 });
 
+// --- Dashboard View ---
+app.get('/dashboard', async (req, res) => {
+  try {
+    // 1. Calculate Uptime
+    const uptimeSeconds = Math.floor((Date.now() - serverStartTime) / 1000);
+    const uptimeStr = `${Math.floor(uptimeSeconds / 3600)}h ${Math.floor((uptimeSeconds % 3600) / 60)}m ${uptimeSeconds % 60}s`;
+
+    // 2. Fetch User Stats
+    const { count: totalUsers } = await supabase.from('users').select('*', { count: 'exact', head: true });
+    const { count: authUsers } = await supabase.from('users').select('*', { count: 'exact', head: true }).eq('is_auth_completed', true);
+
+    // 3. Fetch Upcoming Tasks
+    const now = new Date();
+    const { data: upcomingTasks } = await supabase
+      .from('reminders')
+      .select('task, trigger_time, is_recurring')
+      .eq('is_notified', false)
+      .gt('trigger_time', now.toISOString())
+      .order('trigger_time', { ascending: true })
+      .limit(10);
+
+    // 4. Calculate Estimated Costs based on tracked messages
+    const { data: userData } = await supabase.from('users').select('message_count');
+    const totalMessagesCount = userData ? userData.reduce((acc, user) => acc + (user.message_count || 0), 0) : 0;
+    
+    // Rough estimation: $0.00015 per message (assuming 1K input tokens + 500 output tokens for Flash-preview/Flash-lite)
+    const estimatedCostStr = '$' + (totalMessagesCount * 0.00015).toFixed(4);
+
+    const formatTime = (isoString) => {
+      const d = new Date(isoString);
+      return d.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    };
+
+    const taskRows = upcomingTasks && upcomingTasks.length > 0 
+      ? upcomingTasks.map(t => `
+        <tr class="border-b border-gray-700 hover:bg-gray-700/50 transition">
+          <td class="py-3 px-4 text-gray-300">${formatTime(t.trigger_time)}</td>
+          <td class="py-3 px-4 text-white">${t.task}</td>
+          <td class="py-3 px-4 text-center">
+            ${t.is_recurring ? '<span class="px-2 py-1 bg-green-900/40 text-green-400 text-xs rounded-full border border-green-700/50">週期任務</span>' : '<span class="px-2 py-1 bg-blue-900/40 text-blue-400 text-xs rounded-full border border-blue-700/50">單次提醒</span>'}
+          </td>
+        </tr>
+      `).join('')
+      : '<tr><td colspan="3" class="py-6 text-center text-gray-400">目前沒有即將執行的提醒事項</td></tr>';
+
+    const lastPingStr = lastWakeUpTime 
+      ? lastWakeUpTime.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false }) 
+      : '尚未收到 Ping';
+
+    // Render HTML directly using Tailwind CDN for modern styling
+    const html = `
+    <!DOCTYPE html>
+    <html lang="zh-TW">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>LINE Bot 管理儀表板</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+            body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: #f8fafc; }
+            .glass-card { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(51, 65, 85, 0.5); }
+        </style>
+    </head>
+    <body class="min-h-screen p-6 md:p-12">
+        <div class="max-w-6xl mx-auto">
+            
+            <!-- Header -->
+            <div class="flex items-center justify-between mb-10">
+                <div>
+                    <h1 class="text-3xl font-bold text-white tracking-tight flex items-center gap-3">
+                        <svg class="w-8 h-8 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                        Bot Dashboard
+                    </h1>
+                    <p class="text-gray-400 mt-2 text-sm">系統監控與用量統計中心</p>
+                </div>
+                <div class="flex items-center gap-2 bg-green-900/30 text-green-400 px-4 py-2 rounded-full border border-green-800">
+                    <span class="relative flex h-3 w-3">
+                      <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                      <span class="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
+                    </span>
+                    <span class="text-sm font-medium">系統運行中</span>
+                </div>
+            </div>
+
+            <!-- Metrics Grid -->
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-10">
+                
+                <!-- Metric 1: System Status -->
+                <div class="glass-card rounded-2xl p-6 shadow-xl relative overflow-hidden">
+                    <div class="absolute top-0 right-0 p-4 opacity-10"><svg class="w-16 h-16 text-blue-500" fill="currentColor" viewBox="0 0 20 20"><path d="M2 10a8 8 0 018-8v8h8a8 8 0 11-16 0z"></path><path d="M12 2.252A8.014 8.014 0 0117.748 8H12V2.252z"></path></svg></div>
+                    <p class="text-sm font-medium text-gray-400 mb-1">伺服器連續運行時間</p>
+                    <h3 class="text-3xl font-bold text-white mb-2">${uptimeStr}</h3>
+                    <div class="text-xs text-blue-400 bg-blue-900/30 inline-block px-2 py-1 rounded">
+                        最後喚醒: ${lastPingStr}
+                    </div>
+                </div>
+
+                <!-- Metric 2: User Stats -->
+                <div class="glass-card rounded-2xl p-6 shadow-xl relative overflow-hidden">
+                    <div class="absolute top-0 right-0 p-4 opacity-10"><svg class="w-16 h-16 text-purple-500" fill="currentColor" viewBox="0 0 20 20"><path d="M9 6a3 3 0 11-6 0 3 3 0 016 0zM17 6a3 3 0 11-6 0 3 3 0 016 0zM12.93 17c.046-.327.07-.66.07-1a6.97 6.97 0 00-1.5-4.33A5 5 0 0119 16v1h-6.07zM6 11a5 5 0 015 5v1H1v-1a5 5 0 015-5z"></path></svg></div>
+                    <p class="text-sm font-medium text-gray-400 mb-1">總註冊用戶</p>
+                    <h3 class="text-3xl font-bold text-white mb-2">${totalUsers || 0} <span class="text-lg text-gray-500 font-normal">人</span></h3>
+                    <div class="text-xs text-purple-400 bg-purple-900/30 inline-block px-2 py-1 rounded">
+                        已完成 Drive 記憶授權: ${authUsers || 0}
+                    </div>
+                </div>
+
+                <!-- Metric 3: Message Activity -->
+                <div class="glass-card rounded-2xl p-6 shadow-xl relative overflow-hidden">
+                    <div class="absolute top-0 right-0 p-4 opacity-10"><svg class="w-16 h-16 text-yellow-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clip-rule="evenodd"></path></svg></div>
+                    <p class="text-sm font-medium text-gray-400 mb-1">總處理訊息數量</p>
+                    <h3 class="text-3xl font-bold text-white mb-2">${totalMessagesCount} <span class="text-lg text-gray-500 font-normal">則</span></h3>
+                    <div class="text-xs text-yellow-400 bg-yellow-900/30 inline-block px-2 py-1 rounded">
+                        包含文字、圖片、語音
+                    </div>
+                </div>
+
+                <!-- Metric 4: Cost API -->
+                <div class="glass-card rounded-2xl p-6 shadow-xl relative overflow-hidden">
+                    <div class="absolute top-0 right-0 p-4 opacity-10"><svg class="w-16 h-16 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path d="M8.433 7.418c.155-.103.346-.196.567-.267v1.698a2.305 2.305 0 01-.567-.267C8.07 8.34 8 8.114 8 8c0-.114.07-.34.433-.582zM11 12.849v-1.698c.22.071.412.164.567.267.364.243.433.468.433.582 0 .114-.07.34-.433.582a2.305 2.305 0 01-.567.267z"></path><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-13a1 1 0 10-2 0v.092a4.535 4.535 0 00-1.676.662C6.602 6.234 6 7.009 6 8c0 .99.602 1.765 1.324 2.246.48.32 1.054.545 1.676.662v1.941c-.391-.127-.68-.317-.843-.504a1 1 0 10-1.51 1.311c.562.649 1.413 1.076 2.353 1.253V15a1 1 0 102 0v-.092a4.535 4.535 0 001.676-.662C13.398 13.766 14 12.991 14 12c0-.99-.602-1.765-1.324-2.246A4.535 4.535 0 0011 9.092V7.151c.391.127.68.317.843.504a1 1 0 101.511-1.311c-.563-.649-1.413-1.076-2.354-1.253V5z" clip-rule="evenodd"></path></svg></div>
+                    <p class="text-sm font-medium text-gray-400 mb-1">粗估 Gemini API 花費</p>
+                    <h3 class="text-3xl font-bold text-white mb-2">${estimatedCostStr} <span class="text-lg text-gray-500 font-normal">USD</span></h3>
+                    <div class="text-xs text-green-400 bg-green-900/30 inline-block px-2 py-1 rounded">
+                        基於平均 Token 消耗推算
+                    </div>
+                </div>
+            </div>
+
+            <!-- Task Container -->
+            <div class="glass-card rounded-2xl shadow-xl overflow-hidden">
+                <div class="p-6 border-b border-gray-700/50 flex justify-between items-center bg-gray-800/30">
+                    <h2 class="text-xl font-semibold flex items-center gap-2">
+                        <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        近期即將排程任務 (Top 10)
+                    </h2>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-gray-800/50 text-gray-400 text-sm uppercase tracking-wider">
+                                <th class="py-4 px-4 font-medium">預定觸發時間</th>
+                                <th class="py-4 px-4 font-medium">提醒事項內容</th>
+                                <th class="py-4 px-4 font-medium text-center">類型</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-gray-700">
+                            ${taskRows}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <div class="mt-8 text-center text-gray-500 text-sm">
+                LINE Bot Configuration powered by Antigravity
+            </div>
+        </div>
+    </body>
+    </html>
+    `;
+
+    res.status(200).send(html);
+  } catch (error) {
+    console.error('Dashboard Error:', error);
+    res.status(500).send('Internal Server Error while loading dashboard.');
+  }
+});
+
 // --- Google Drive Memory Helpers ---
 async function getDriveClient(refreshToken) {
   const auth = new google.auth.OAuth2(
@@ -219,6 +392,27 @@ app.post('/webhook', line.middleware(config), (req, res) => {
 // event handler
 async function handleEvent(event) {
   console.log('Received event:', JSON.stringify(event, null, 2));
+
+  // --- Track Message Usage ---
+  if (event.type === 'message') {
+      try {
+          // Increment message_count for the user smoothly
+          const { data: userRecord } = await supabase
+              .from('users')
+              .select('message_count')
+              .eq('line_user_id', event.source.userId)
+              .single();
+          
+          const newCount = userRecord ? (userRecord.message_count || 0) + 1 : 1;
+          
+          await supabase.from('users').upsert(
+              { line_user_id: event.source.userId, message_count: newCount },
+              { onConflict: 'line_user_id', ignoreDuplicates: false }
+          );
+      } catch (err) {
+          console.error('Failed to update message count tracking:', err);
+      }
+  }
 
   try {
     // 1. 處理一般文字訊息 (一般 AI 聊天或設定/查詢/取消提醒)

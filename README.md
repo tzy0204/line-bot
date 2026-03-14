@@ -82,6 +82,7 @@
 | `selected_model`        | `text`    | 使用者偏好的 AI 模型            |
 | `google_refresh_token`  | `text`    | Google OAuth 的 Refresh Token |
 | `is_auth_completed`     | `boolean` | 是否完成 Google 授權            |
+| `message_count`         | `int4`    | 推算 API 成本用的訊息總量計數     |
 
 **`reminders` 表：**
 | Column            | Type          | Notes                        |
@@ -148,6 +149,7 @@
 | `/wake-up`          | GET    | 防休眠喚醒端點，需帶 `?token=<PING_TOKEN>` 驗證        |
 | `/auth`             | GET    | Google OAuth2 授權起始頁，需帶 `?uid=<LINE_USER_ID>`  |
 | `/oauth2callback`   | GET    | Google OAuth2 授權成功後的回呼端點                      |
+| `/dashboard`        | GET    | Bot 管理儀表板介面 (Tailwind UI)                       |
 
 ---
 
