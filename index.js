@@ -535,9 +535,23 @@ async function handleEvent(event) {
       // 使用 Asia/Taipei 時區的字串，讓 Gemini 知道現在的台灣時間
       const nowStr = now.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
 
-      const prompt = `使用者說了一句話：「${userText}」
+      // 取出使用者的歷史紀錄，作為判斷意圖的文本上下文
+      const { data: userContext } = await supabase
+        .from('users')
+        .select('chat_history')
+        .eq('line_user_id', event.source.userId)
+        .single();
+      
+      let contextStr = '';
+      if (userContext && Array.isArray(userContext.chat_history) && userContext.chat_history.length > 0) {
+        // 只拿最後 4 句話作為短期語境 (避免 Token 過度消耗)
+        const recentHistory = userContext.chat_history.slice(-4);
+        contextStr = '【近期對話上下文】\n' + recentHistory.map(h => `${h.role === 'user' ? '使用者' : 'AI'}: ${h.text}`).join('\n') + '\n\n';
+      }
 
-請分析這句話的意圖，判斷屬於以下哪一種操作。現在的台灣時間是：${nowStr}
+      const prompt = `${contextStr}【最新訊息】\n使用者說了一句話：「${userText}」
+
+請分析這句【最新訊息】的意圖（若語意不清，請參考上方的對話上下文），判斷屬於以下哪一種操作。現在的台灣時間是：${nowStr}
 
 【意圖 1：CREATE (建立提醒)】
 如果使用者要求「設定提醒事項」或「定時叫我做某事」，請進一步判斷這是一個「單次提醒」還是「週期性提醒（例如：每週三晚上七點、每天早上八點）」。
