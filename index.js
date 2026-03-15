@@ -665,20 +665,6 @@ async function handleEvent(event) {
             rc: r.is_recurring ? 1 : 0
           }));
           
-          // ✨ 新版解法：為了徹底繞過 LINE Payload 300 字元的限制（因為 task 內含地址電話會很長）
-          // 我們將這整包選項陣列存入 Supabase users 表中的一份欄位 (例如：提醒草稿暫存區)
-          const { error: draftUpdateError } = await supabase
-            .from('users')
-            .update({ chat_history: miniPayloads }) // 先借用 chat_history 欄位或是如果有的話建議新增一個欄位，但怕動到 DB 先把 payload 用記憶暫存法，我們這裡直接存為 json
-            .eq('line_user_id', event.source.userId);
-            
-          // *更新*：為了不覆蓋 chat_history，也無需新增欄位。我們改存在一個全新的暫存 table？不，我們直接將資料存在 local cache 或是為了 stateless 直接用一個簡單編碼
-          // 等一下，既然我們有資料庫，其實只要把他們標記為 is_notified = false, status = 'draft' 就好，但因為 schema 沒有 status，
-          // 用「將資料寫入這張 user 的專屬草稿列」是最安全的。為了免去 user 重新新增欄位的麻煩，我們再次妥協並截斷文字至安全水準嗎？
-          // 不！我們決定：乾脆把選項精煉到極致：只傳送 `action=setrmd&idx...`，但是資料去哪裡拿？
-          // 最優雅的做法是：我們把整包 miniPayloads 存進 Supabase `users` 表的 `reminder_draft` 裡。
-          // 為了這個，我會請 supabase 去 upsert (如果有這個欄位)。如果沒有該欄位，我們可以先借用一個 JSON 倉庫？
-          
           // 真正的解法：直接在提醒資料表裡面寫入這三筆，但是標記為 `is_draft = true`！因為沒這欄位，我們採用更聰明的做法：
           // 將提醒寫入 reminders 表，但 trigger_time 設為非常遙遠的未來（例如 2099 年），作為暫存區。
           // 當使用者點擊確認後，我們再把 2099 年的那個任務的時間「改回他真正的時間」。這就不需要改任何 schema！
@@ -838,10 +824,12 @@ async function handleEvent(event) {
 
           // 注入短期記憶 (chat_history)
           const history = Array.isArray(user?.chat_history) ? user.chat_history : [];
-          const geminiHistoryFormat = history.map(h => ({
-            role: h.role,
-            parts: [{ text: h.text }]
-          }));
+          const geminiHistoryFormat = history
+            .filter(h => h && h.role && h.text) // 確保過濾掉可能被污染或不合法的歷史結構
+            .map(h => ({
+              role: h.role,
+              parts: [{ text: h.text }]
+            }));
 
           const chat = ai.chats.create({
             model: targetModel,
