@@ -639,22 +639,80 @@ async function handleEvent(event) {
             return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 無法解析提醒內容，請重新檢查您的描述。' }]);
           }
 
-          const { error: insertError } = await supabase.from('reminders').insert(remindersToInsert);
-
-          if (insertError) {
-            console.error('Insert reminder error:', insertError);
-            return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 儲存提醒發生錯誤，請稍後再試。' }]);
+          // 如果只有單筆提醒，直接存入並回覆
+          if (remindersToInsert.length === 1) {
+            const { error: insertError } = await supabase.from('reminders').insert(remindersToInsert);
+            if (insertError) {
+              console.error('Insert reminder error:', insertError);
+              return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 儲存提醒發生錯誤，請稍後再試。' }]);
+            }
+            const r = remindersToInsert[0];
+            const localTime = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
+            return await client.replyMessage(event.replyToken, [{
+              type: 'text',
+              text: `✅ 幫您記下來了！\n\n我會在以下時間提醒您：\n👉 [${localTime}] ${r.task}`
+            }]);
           }
 
-          let replyMsg = '✅ 幫您記下來了！\n\n我會在以下時間提醒您：\n';
-          remindersToInsert.forEach(r => {
+          // 如果有多筆建議，彈出 Quick Reply 選單讓使用者決定
+          // 將提醒資料暫存於 Supabase (因 payload 字數限制，採用 memory 表存查)
+          // 為了簡化，LINE Quick Reply Payload 限 300 字。若資料簡單可直接包裹 json
+          // 若擔心過長，也可以暫存至 DB，這裏示範「直接帶精簡 JSON 走 Payload」的方式，因為我們只傳「索引」加上「核心屬性」
+          
+          // 將提醒縮短成精練版本放進 payload (確保小於 300字元)
+          const miniPayloads = remindersToInsert.map(r => ({
+            t: r.task.substring(0, 15), // 截斷過長文字
+            dt: r.trigger_time,
+            rc: r.is_recurring ? 1 : 0
+          }));
+          
+          const items = [];
+          
+          miniPayloads.forEach((mp, index) => {
+            const btnLabel = `選項 ${index + 1}: ${new Date(mp.dt).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' })}`;
+            items.push({
+              type: 'action',
+              action: {
+                type: 'postback',
+                label: btnLabel.substring(0, 20), // label 最多 20 字
+                data: `action=setrmd&idx=${index}&p=${JSON.stringify(miniPayloads)}`,
+                displayText: `我要設定 ${btnLabel}`
+              }
+            });
+          });
+
+          // 加入「全部都要」選項
+          items.push({
+            type: 'action',
+            action: {
+              type: 'postback',
+              label: '全都要設定 🎉',
+              data: `action=setrmd&idx=all&p=${JSON.stringify(miniPayloads)}`,
+              displayText: '請幫我把這些建議的時間「全部」設定提醒。'
+            }
+          });
+
+          // 加入取消選項
+          items.push({
+            type: 'action',
+            action: {
+              type: 'postback',
+              label: '都不需要 ❌',
+              data: `action=cancelrmd`,
+              displayText: '先不要設定提醒好了'
+            }
+          });
+
+          let replyMsg = '💡 我分析出幾個適合的提醒時間點，您想設定哪一個呢？\n';
+          remindersToInsert.forEach((r, idx) => {
             const localTime = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
-            replyMsg += `👉 [${localTime}] ${r.task}\n`;
+            replyMsg += `\n[選項 ${idx + 1}] ${localTime}\n👉 ${r.task}\n`;
           });
 
           return await client.replyMessage(event.replyToken, [{
             type: 'text',
-            text: replyMsg.trim()
+            text: replyMsg.trim(),
+            quickReply: { items }
           }]);
         }
         else if (parsedData.intent === 'QUERY') {
@@ -875,12 +933,13 @@ async function handleEvent(event) {
       }]);
     }
 
-    // 4. 處理使用者點擊快速回覆的事件 (進行語音處理)
+    // 4. 處理使用者點擊快速回覆的事件 (Postback 處理器)
     if (event.type === 'postback' && event.postback.data) {
       const data = new URLSearchParams(event.postback.data);
       const action = data.get('action');
-      const msgId = data.get('msgId');
 
+      // (A) 處理語音潤飾 / 翻譯
+      const msgId = data.get('msgId');
       if ((action === 'polish' || action === 'translate') && msgId) {
         // 從 LINE 伺服器下載語音檔案
         const stream = await client.getMessageContent(msgId);
@@ -938,6 +997,57 @@ async function handleEvent(event) {
         await saveChatHistory(event.source.userId, userActionText, replyText);
 
         return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyText }]);
+      }
+
+      // (B) 處理使用者從「多重提醒」Quick Reply 選單送出的選項
+      if (action === 'cancelrmd') {
+        return await client.replyMessage(event.replyToken, [{ type: 'text', text: '好的，已為您取消這次的提醒設定！' }]);
+      }
+
+      if (action === 'setrmd') {
+        const idx = data.get('idx');
+        const pStr = data.get('p') || '[]';
+        let miniPayloads = [];
+        try {
+          miniPayloads = JSON.parse(pStr);
+        } catch (e) {
+          return await client.replyMessage(event.replyToken, [{ type: 'text', text: '⚠️ 讀取提醒選項失敗，請重新輸入指令嘗試一次。' }]);
+        }
+
+        let selection = [];
+        if (idx === 'all') {
+          selection = miniPayloads;
+        } else {
+          const matched = miniPayloads[parseInt(idx, 10)];
+          if (matched) selection.push(matched);
+        }
+
+        if (selection.length === 0) {
+          return await client.replyMessage(event.replyToken, [{ type: 'text', text: '⚠️ 找不到對應的提醒選項，請重試。' }]);
+        }
+
+        // 把 miniPayload 還原回 Supabase 格式
+        const remindersToInsert = selection.map(s => ({
+          line_user_id: event.source.userId,
+          task: s.t,
+          trigger_time: s.dt,
+          is_recurring: s.rc === 1,
+          cron_expression: null // 簡化版 payload 中我們沒有帶 cron，預設為 null 單次
+        }));
+
+        const { error: insertError } = await supabase.from('reminders').insert(remindersToInsert);
+        if (insertError) {
+          console.error('Insert reminder error (postback):', insertError);
+          return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 儲存提醒發生錯誤，請稍後再試。' }]);
+        }
+
+        let replyMsg = '✅ 幫您記下來了！我會在以下時間提醒您：\n';
+        remindersToInsert.forEach(r => {
+          const localTime = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
+          replyMsg += `👉 [${localTime}] ${r.task}\n`;
+        });
+
+        return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyMsg.trim() }]);
       }
     }
 
