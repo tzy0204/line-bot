@@ -457,6 +457,28 @@ async function handleEvent(event) {
     }
   }
 
+  // --- Helper: Save Chat History ---
+  async function saveChatHistory(userId, userText, modelReplyText) {
+    try {
+      const { data: user } = await supabase
+        .from('users')
+        .select('chat_history')
+        .eq('line_user_id', userId)
+        .single();
+        
+      const history = Array.isArray(user?.chat_history) ? user.chat_history : [];
+      const newHistory = [
+        ...history,
+        { role: 'user', text: userText },
+        { role: 'model', text: modelReplyText }
+      ].slice(-20); // Keep last 20 messages (10 interactions)
+      
+      await supabase.from('users').update({ chat_history: newHistory }).eq('line_user_id', userId);
+    } catch (e) {
+      console.error('Failed to save chat history:', e);
+    }
+  }
+
   try {
     // 1. 處理一般文字訊息 (一般 AI 聊天或設定/查詢/取消提醒)
     if (event.type === 'message' && event.message.type === 'text') {
@@ -734,14 +756,8 @@ async function handleEvent(event) {
 
           const replyText = chatResponse.text || '好的，我記下來了！';
 
-          // 更新短期記憶 (只保留最後 10 次對話 = 20筆 role)
-          const newHistory = [
-            ...history,
-            { role: 'user', text: userText },
-            { role: 'model', text: replyText }
-          ].slice(-20); // 保留最近 20 筆紀錄
-
-          await supabase.from('users').update({ chat_history: newHistory }).eq('line_user_id', event.source.userId);
+          // 更新短期記憶
+          await saveChatHistory(event.source.userId, userText, replyText);
 
           return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyText }]);
         }
@@ -788,7 +804,11 @@ async function handleEvent(event) {
           ]
         });
 
-        return await client.replyMessage(event.replyToken, [{ type: 'text', text: response.text }]);
+        const replyText = response.text || '我已經收到這張圖片了。';
+        // 將圖片解析結果加入記憶，方便後續上下文對答
+        await saveChatHistory(event.source.userId, "[使用者傳送了一張圖片]", replyText);
+
+        return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyText }]);
       } catch (err) {
         console.error('處理圖片失敗:', err);
         return await client.replyMessage(event.replyToken, [{ type: 'text', text: '抱歉，我在「看」這張圖片時睜不開眼睛，處理發生了一點錯誤。' }]);
@@ -878,7 +898,16 @@ async function handleEvent(event) {
           ]
         });
 
-        return await client.replyMessage(event.replyToken, [{ type: 'text', text: response.text }]);
+        const replyText = response.text || '語音處理完成。';
+        
+        // 根據不同 Action 設定 User 歷史記憶的代表文字
+        const userActionText = action === 'polish' 
+          ? "[使用者傳送了一段需要潤飾的語音]" 
+          : "[使用者傳送了一段需要翻譯的語音]";
+          
+        await saveChatHistory(event.source.userId, userActionText, replyText);
+
+        return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyText }]);
       }
     }
 
