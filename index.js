@@ -554,14 +554,18 @@ async function handleEvent(event) {
 請分析這句【最新訊息】的意圖（若語意不清，請參考上方的對話上下文），判斷屬於以下哪一種操作。現在的台灣時間是：${nowStr}
 
 【意圖 1：CREATE (建立提醒)】
-如果使用者要求「設定提醒事項」或「定時叫我做某事」，請進一步判斷這是一個「單次提醒」還是「週期性提醒（例如：每週三晚上七點、每天早上八點）」。
+如果使用者要求「設定提醒事項」或「定時叫我做某事」，請進一步判斷這是一個「單次提醒」還是「週期性提醒」。如果對話上下文中有建議「多個時間點」的提醒（例如：前一天晚上提醒、包含當天出發前提醒），請將這些獨立的提醒全部分別萃取出並放入陣列中。
 推算邏輯請以台灣時間為準，並回傳以下嚴格的 JSON 格式：
 {
   "intent": "CREATE",
-  "task": "提醒的具體事情（例如：回診打疫苗、去健身）",
-  "triggerTime": "ISO 8601 格式的 UTC 時間字串，代表『下一次』要觸發的時間（例如：2024-05-15T12:00:00.000Z，需轉成 UTC）",
-  "isRecurring": true 或 false,
-  "cronExpression": "如果是週期性提醒，提供標準的 cron 表示式字串(分 時 日 月 星期)，時區以 UTC 計算。若非週期性請填 null"
+  "reminders": [
+    {
+      "task": "提醒的具體事情（例如：回診打疫苗、提前一天準備證件、去健身）",
+      "triggerTime": "ISO 8601 格式的 UTC 時間字串，代表『下一次』要觸發的時間（例如：2024-05-15T12:00:00.000Z，需轉成 UTC）",
+      "isRecurring": true 或 false,
+      "cronExpression": "如果是週期性提醒，提供標準的 cron 表示式字串(分 時 日 月 星期)，時區以 UTC 計算。若非週期性請填 null"
+    }
+  ]
 }
 
 【意圖 2：QUERY (查詢提醒)】
@@ -622,23 +626,35 @@ async function handleEvent(event) {
           );
 
           // 寫入 Supabase reminders table
-          const { error: insertError } = await supabase.from('reminders').insert([{
+          const remindersArray = parsedData.reminders || [parsedData]; // 兼容新舊格式
+          const remindersToInsert = remindersArray.filter(r => r.task && r.triggerTime).map(r => ({
             line_user_id: event.source.userId,
-            task: parsedData.task,
-            trigger_time: new Date(parsedData.triggerTime).toISOString(),
-            is_recurring: parsedData.isRecurring || false,
-            cron_expression: parsedData.cronExpression || null
-          }]);
+            task: r.task,
+            trigger_time: new Date(r.triggerTime).toISOString(),
+            is_recurring: r.isRecurring || false,
+            cron_expression: r.cronExpression || null
+          }));
+
+          if (remindersToInsert.length === 0) {
+            return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 無法解析提醒內容，請重新檢查您的描述。' }]);
+          }
+
+          const { error: insertError } = await supabase.from('reminders').insert(remindersToInsert);
 
           if (insertError) {
             console.error('Insert reminder error:', insertError);
             return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 儲存提醒發生錯誤，請稍後再試。' }]);
           }
 
-          const localTime = new Date(parsedData.triggerTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
+          let replyMsg = '✅ 幫您記下來了！\n\n我會在以下時間提醒您：\n';
+          remindersToInsert.forEach(r => {
+            const localTime = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
+            replyMsg += `👉 [${localTime}] ${r.task}\n`;
+          });
+
           return await client.replyMessage(event.replyToken, [{
             type: 'text',
-            text: `✅ 幫您記下來了！\n\n我會在 ${localTime} 提醒您：\n👉 ${parsedData.task}`
+            text: replyMsg.trim()
           }]);
         }
         else if (parsedData.intent === 'QUERY') {
