@@ -597,6 +597,26 @@ async function handleEvent(event) {
     if (event.type === 'message' && event.message.type === 'text') {
       const userText = event.message.text.trim();
 
+      // --- 🛡️ 測試人員 Email 自動收集邏輯 ---
+      // 若內容看起來像 Gmail 且用戶尚未完成授權，自動紀錄以便管理員加入 GCP 測試人員名單
+      const gmailRegex = /([a-zA-Z0-9._-]+@gmail\.com)/i;
+      const match = userText.match(gmailRegex);
+      if (match) {
+        // 先確認用戶授權狀態
+        const { data: userAuth } = await supabase
+          .from('users')
+          .select('is_auth_completed')
+          .eq('line_user_id', event.source.userId)
+          .single();
+        
+        if (!userAuth || !userAuth.is_auth_completed) {
+          const detectedEmail = match[1];
+          await supabase.from('users').update({ reported_email: detectedEmail }).eq('line_user_id', event.source.userId);
+          console.log(`[Admin] Detected pending tester email: ${detectedEmail} for user ${event.source.userId}`);
+          // 這裡不中斷流程，讓 AI 繼續回覆（AI 已經在 systemInstruction 被告知如何引導）
+        }
+      }
+
       // 處理 /model 指令
       if (userText.startsWith('/model')) {
         const args = userText.split(' ');
