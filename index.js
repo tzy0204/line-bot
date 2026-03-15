@@ -30,8 +30,103 @@ const client = new line.Client(config);
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // create Express app
-// about Express itself: https://expressjs.com/
 const app = express();
+
+// ==========================================
+// 共用函數分享區
+// ==========================================
+
+// 將對話上下文存入 Supabase (維持最新 10 次對答，即 20 筆訊息)
+async function saveChatHistory(userId, userText, modelText) {
+
+  const { data: userData } = await supabase
+    .from('users')
+    .select('chat_history')
+    .eq('line_user_id', userId)
+    .single();
+
+  let history = Array.isArray(userData?.chat_history) ? userData.chat_history : [];
+
+  history.push({ role: 'user', text: userText });
+  history.push({ role: 'model', text: modelText });
+
+  if (history.length > 20) {
+    history = history.slice(-20);
+  }
+
+  await supabase
+    .from('users')
+    .update({ chat_history: history })
+    .eq('line_user_id', userId);
+}
+
+// 將多筆 AI 預約單轉換為 LINE Quick Reply 選單，並將細節安全備份至資料庫 Draft 狀態
+async function generateReminderQuickReplyMessage(userId, remindersToInsert) {
+  let draftRefs = [];
+  for (let r of remindersToInsert) {
+    // 將真正要觸發的時間藏在 task 字串的魔法標記裡，並把 trigger 設為 2099 避開排程
+    const isRecurringFlag = r.is_recurring ? 1 : 0;
+    const encodedTask = `[DRAFT]${r.trigger_time}|${isRecurringFlag}|${r.task}`;
+    const { data: draftData } = await supabase.from('reminders').insert({
+      line_user_id: userId,
+      task: encodedTask,
+      trigger_time: new Date('2099-12-31T23:59:59Z').toISOString(),
+      is_recurring: false // 草稿狀態皆預設單次
+    }).select('id').single();
+    
+    if (draftData) draftRefs.push(draftData.id);
+  }
+
+  const items = [];
+  
+  remindersToInsert.forEach((r, index) => {
+    if (!draftRefs[index]) return; // 如果寫入失敗就忽略
+    const btnLabel = `選項 ${index + 1}: ${new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' })}`;
+    items.push({
+      type: 'action',
+      action: {
+        type: 'postback',
+        label: btnLabel.substring(0, 20), // label 最多 20 字
+        data: `action=setrmd&id=${draftRefs[index]}`, 
+        displayText: `我要設定 ${btnLabel}`
+      }
+    });
+  });
+
+  // 加入「全部都要」選項
+  items.push({
+    type: 'action',
+    action: {
+      type: 'postback',
+      label: '全都要設定 🎉',
+      data: `action=setrmdall&ids=${draftRefs.join(',')}`,
+      displayText: '請幫我把這些建議的時間「全部」設定提醒。'
+    }
+  });
+
+  // 加入取消選項
+  items.push({
+    type: 'action',
+    action: {
+      type: 'postback',
+      label: '都不需要 ❌',
+      data: `action=cancelrmd&ids=${draftRefs.join(',')}`, 
+      displayText: '先不要設定提醒好了'
+    }
+  });
+
+  let replyMsg = '💡 已為您規劃好了適合的提醒時間點，您想設定哪一個呢？\n';
+  remindersToInsert.forEach((r, idx) => {
+    const localTime = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
+    replyMsg += `\n[選項 ${idx + 1}] ${localTime}\n👉 ${r.task}\n`;
+  });
+
+  return {
+    type: 'text',
+    text: replyMsg.trim(),
+    quickReply: { items }
+  };
+}
 
 // Server status tracking
 let lastWakeUpTime = null;
@@ -661,80 +756,8 @@ async function handleEvent(event) {
           }
 
           // 如果有多筆建議，彈出 Quick Reply 選單讓使用者決定
-          // 將提醒縮短成精練版本放進 payload
-          const miniPayloads = remindersToInsert.map(r => ({
-            t: r.task, 
-            dt: r.trigger_time,
-            rc: r.is_recurring ? 1 : 0
-          }));
-          
-          // 真正的解法：直接在提醒資料表裡面寫入這三筆，但是標記為 `is_draft = true`！因為沒這欄位，我們採用更聰明的做法：
-          // 將提醒寫入 reminders 表，但 trigger_time 設為非常遙遠的未來（例如 2099 年），作為暫存區。
-          // 當使用者點擊確認後，我們再把 2099 年的那個任務的時間「改回他真正的時間」。這就不需要改任何 schema！
-          
-          let draftRefs = [];
-          for (let mp of miniPayloads) {
-            // 將真正要觸發的時間藏在 task 字串的魔法標記裡，並把 trigger 設為 2099 避開排程
-            const encodedTask = `[DRAFT]${mp.dt}|${mp.rc}|${mp.t}`;
-            const { data: draftData, error: draftErr } = await supabase.from('reminders').insert({
-              line_user_id: event.source.userId,
-              task: encodedTask,
-              trigger_time: new Date('2099-12-31T23:59:59Z').toISOString(),
-              is_recurring: false // 草稿狀態皆預設單次
-            }).select('id').single();
-            
-            if (draftData) draftRefs.push(draftData.id);
-          }
-
-          const items = [];
-          
-          miniPayloads.forEach((mp, index) => {
-            if (!draftRefs[index]) return; // 如果寫入失敗就忽略
-            const btnLabel = `選項 ${index + 1}: ${new Date(mp.dt).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' })}`;
-            items.push({
-              type: 'action',
-              action: {
-                type: 'postback',
-                label: btnLabel.substring(0, 20), // label 最多 20 字
-                data: `action=setrmd&id=${draftRefs[index]}`, // 只傳 DB ID，絕對不會超過 300 字
-                displayText: `我要設定 ${btnLabel}`
-              }
-            });
-          });
-
-          // 加入「全部都要」選項
-          items.push({
-            type: 'action',
-            action: {
-              type: 'postback',
-              label: '全都要設定 🎉',
-              data: `action=setrmdall&ids=${draftRefs.join(',')}`,
-              displayText: '請幫我把這些建議的時間「全部」設定提醒。'
-            }
-          });
-
-          // 加入取消選項
-          items.push({
-            type: 'action',
-            action: {
-              type: 'postback',
-              label: '都不需要 ❌',
-              data: `action=cancelrmd&ids=${draftRefs.join(',')}`, // 帶入 ids 以便我們後續清掉垃圾草稿
-              displayText: '先不要設定提醒好了'
-            }
-          });
-
-          let replyMsg = '💡 我分析出幾個適合的提醒時間點，您想設定哪一個呢？\n';
-          remindersToInsert.forEach((r, idx) => {
-            const localTime = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
-            replyMsg += `\n[選項 ${idx + 1}] ${localTime}\n👉 ${r.task}\n`;
-          });
-
-          return await client.replyMessage(event.replyToken, [{
-            type: 'text',
-            text: replyMsg.trim(),
-            quickReply: { items }
-          }]);
+          const replyMessage = await generateReminderQuickReplyMessage(event.source.userId, remindersToInsert);
+          return await client.replyMessage(event.replyToken, [replyMessage]);
         }
         else if (parsedData.intent === 'QUERY') {
           // 查詢本週提醒 (未來 7 天內)
@@ -891,7 +914,27 @@ async function handleEvent(event) {
         const base64Image = imageBuffer.toString('base64');
 
         // 準備送給 Gemini 的 Prompt
-        const prompt = '請判斷這張圖片的主要內容。如果是文件或單據，請幫我萃取重點資訊；如果是物品或場景，請說明核心主題即可，不需要描述無關緊要的背景細節（例如手、桌面等）。\n\n🌟 特別注意：如果這是一張「醫院診所的預約單、掛號單、檢查單」，請務必極度精確地辨識並提取出：【確切的日期與時段】、【診間號碼】（例如 33 診）、【預約序號 / 看診號碼】（例如 1 號）、【檢查項目】以及任何【聯絡電話與地點】。若是同一張單據有多個不同的門診或檢查預約，請將這些時間點的資訊一一列出。\n\n請用繁體中文、自然友善的語氣回覆。';
+        const prompt = `請判斷這張圖片的主要內容。如果是文件或單據，請幫我萃取重點資訊；如果是物品或場景，請說明核心主題即可，不需要描述無關緊要的背景細節（例如手、桌面等）。
+
+🌟 特別注意：如果這是一張「醫院診所的預約單、掛號單、檢查單」，請務必極度精確地辨識並提取出：【確切的日期與時段】、【診間號碼】（例如 33 診）、【預約序號 / 看診號碼】（例如 1 號）、【檢查項目】以及任何【聯絡電話與地點】。若是同一張單據有多個不同的門診或檢查預約，請將這些時間點的資訊一一列出。
+
+【輸出格式要求】
+請務必嚴格輸出合法的 JSON 格式，不要包含 Markdown 語法或其餘閒聊，JSON 結構如下：
+{
+  "description": "這裡是針對圖片的繁體中文分析與萃取出的所有細節重點，自然友善的語氣",
+  "has_events": true 或者是 false (如果圖片中包含任何未來事件或預約，請設為 true),
+  "reminders": [
+    // 只有當 has_events 為 true 時才需要填寫。請針對每一個獨立事件給出 2 個時段建議：
+    // (a) 若事件在下午或晚上 -> 當天上午提醒；若在上午 -> 前一天晚上提醒。
+    // (b) 統一提前 2 小時提醒。
+    {
+      "task": "把上面的包含診號、聯絡方式與檢查項目的細節塞進這個字串，並標註這是提前2小時或是早晚彈性提醒",
+      "triggerTime": "ISO 8601 UTC 時間字串，例如：2024-05-15T12:00:00.000Z",
+      "isRecurring": false,
+      "cronExpression": null
+    }
+  ]
+}`;
 
         // 查詢用戶設定的偏好模型 (圖片分析偏向複雜理解，預設使用 3-flash-preview)
         const { data: userSetting } = await supabase
@@ -915,11 +958,45 @@ async function handleEvent(event) {
           ]
         });
 
-        const replyText = response.text || '我已經收到這張圖片了。';
+        // 嘗試解析回傳的 JSON
+        let parsedData = null;
+        let replyText = '我已經收到這張圖片了。';
+        let messages = [];
+
+        try {
+          const jsonStr = response.text.replace(/^\`\`\`json/m, '').replace(/\`\`\`$/m, '').trim();
+          if (jsonStr.startsWith('{')) {
+            parsedData = JSON.parse(jsonStr);
+            replyText = parsedData.description || replyText;
+          } else {
+             replyText = response.text; // 如果沒有按規矩吐出 JSON，退回到直接顯示文字
+          }
+        } catch (e) {
+          replyText = response.text;
+        }
+
+        // 第一則訊息：圖片描述
+        messages.push({ type: 'text', text: replyText });
+
+        // 如果圖片中有事件，掛載 Reminder Quick Reply (第二則訊息)
+        if (parsedData && parsedData.has_events && parsedData.reminders && parsedData.reminders.length > 0) {
+          // 將 JSON 的 triggerTime 映射為 trigger_time (與資料庫欄位名稱對齊)
+          const formattedReminders = parsedData.reminders.map(r => ({
+            ...r,
+            trigger_time: r.triggerTime,
+            is_recurring: r.isRecurring || false,
+          })).filter(r => r.task && r.trigger_time);
+
+          if (formattedReminders.length > 0) {
+            const qrMessage = await generateReminderQuickReplyMessage(event.source.userId, formattedReminders);
+            messages.push(qrMessage);
+          }
+        }
+
         // 將圖片解析結果加入記憶，方便後續上下文對答
         await saveChatHistory(event.source.userId, "[使用者傳送了一張圖片]", replyText);
 
-        return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyText }]);
+        return await client.replyMessage(event.replyToken, messages);
       } catch (err) {
         console.error('處理圖片失敗:', err);
         return await client.replyMessage(event.replyToken, [{ type: 'text', text: '抱歉，我在「看」這張圖片時睜不開眼睛，處理發生了一點錯誤。' }]);
