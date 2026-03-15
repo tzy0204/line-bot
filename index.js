@@ -613,6 +613,19 @@ async function handleEvent(event) {
           const detectedEmail = match[1];
           await supabase.from('users').update({ reported_email: detectedEmail }).eq('line_user_id', event.source.userId);
           console.log(`[Admin] Detected pending tester email: ${detectedEmail} for user ${event.source.userId}`);
+          
+          // ✅ 推播通知管理員 (ADMIN_LINE_USER_ID 環境變數)
+          if (process.env.ADMIN_LINE_USER_ID) {
+            const notifyTime = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
+            try {
+              await client.pushMessage(process.env.ADMIN_LINE_USER_ID, {
+                type: 'text',
+                text: `🔔 [管理員通知]\n有新測試人員需要加入 GCP 白名單！\n\n📧 Email：${detectedEmail}\n👤 LINE ID：${event.source.userId}\n🕐 時間：${notifyTime}\n\n請前往 GCP Console → OAuth consent screen → Test users 新增此 Email。`
+              });
+            } catch (pushErr) {
+              console.error('[Admin] Failed to push notification to admin:', pushErr.message);
+            }
+          }
           // 這裡不中斷流程，讓 AI 繼續回覆（AI 已經在 systemInstruction 被告知如何引導）
         }
       }
