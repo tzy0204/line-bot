@@ -62,6 +62,23 @@ async function saveChatHistory(userId, userText, modelText) {
 
 // 將多筆 AI 預約單轉換為 LINE Quick Reply 選單，並將細節安全備份至資料庫 Draft 狀態
 async function generateReminderQuickReplyMessage(userId, remindersToInsert) {
+  // ✅ 清除策略：在插入本次新草稿之前，先刪除該用戶所有舊的 [DRAFT] 草稿
+  // 說明：
+  // - 為什麼在這裡清除？ 因為此函數是「產生 Quick Reply 選單」的唯一入口點。
+  //   只有在「確實要跳出新選單」時才會呼叫，確保不影響一般聊天流程。
+  // - 為什麼不會砍掉同一張圖片的多個項目？
+  //   因為同一張預約單掃描到的所有提醒選項，會在本次迴圈中一次性全部插入，
+  //   清除動作在迴圈之前，所以同批次的選項全部都能完整保留。
+  // - 為什麼不影響已確認的提醒？
+  //   因為已確認的提醒其 trigger_time 已被更新為正確時間（不再是 2099 年），
+  //   我們只刪除 trigger_time 為 2099-12-31 的草稿。
+  await supabase
+    .from('reminders')
+    .delete()
+    .eq('line_user_id', userId)
+    .eq('trigger_time', new Date('2099-12-31T23:59:59Z').toISOString())
+    .like('task', '[DRAFT]%');
+
   let draftRefs = [];
   for (let r of remindersToInsert) {
     // 將真正要觸發的時間藏在 task 字串的魔法標記裡，並把 trigger 設為 2099 避開排程
@@ -76,6 +93,7 @@ async function generateReminderQuickReplyMessage(userId, remindersToInsert) {
     
     if (draftData) draftRefs.push(draftData.id);
   }
+
 
   const items = [];
   
