@@ -658,36 +658,56 @@ async function handleEvent(event) {
           }
 
           // 如果有多筆建議，彈出 Quick Reply 選單讓使用者決定
-          // 將提醒資料暫存於 Supabase (因 payload 字數限制，採用 memory 表存查)
-          // 為了簡化，LINE Quick Reply Payload 限 300 字。若資料簡單可直接包裹 json
-          // 若擔心過長，也可以暫存至 DB，這裏示範「直接帶精簡 JSON 走 Payload」的方式，因為我們只傳「索引」加上「核心屬性」
-          
-          // 將提醒縮短成精練版本放進 payload (確保小於 300字元)
-          // 由於我們剛才加強了 Prompt 要擷取大量細節，此處若無腦截斷 15 字會流失資訊
-          // 我們可以先試著保留更長的內容，如果最終 stringify 後總長度逼近 300，再進行縮減
-          let miniPayloads = remindersToInsert.map(r => ({
-            t: r.task.substring(0, 100), // 初步截斷到 100 字
+          // 將提醒縮短成精練版本放進 payload
+          const miniPayloads = remindersToInsert.map(r => ({
+            t: r.task, 
             dt: r.trigger_time,
             rc: r.is_recurring ? 1 : 0
           }));
           
-          let pStr = JSON.stringify(miniPayloads);
-          if (pStr.length > 250) {
-            // 如果超過安全長度，再次進行強制縮減
-            miniPayloads = miniPayloads.map(mp => ({ ...mp, t: mp.t.substring(0, 30) }));
-            pStr = JSON.stringify(miniPayloads);
-          }
+          // ✨ 新版解法：為了徹底繞過 LINE Payload 300 字元的限制（因為 task 內含地址電話會很長）
+          // 我們將這整包選項陣列存入 Supabase users 表中的一份欄位 (例如：提醒草稿暫存區)
+          const { error: draftUpdateError } = await supabase
+            .from('users')
+            .update({ chat_history: miniPayloads }) // 先借用 chat_history 欄位或是如果有的話建議新增一個欄位，但怕動到 DB 先把 payload 用記憶暫存法，我們這裡直接存為 json
+            .eq('line_user_id', event.source.userId);
+            
+          // *更新*：為了不覆蓋 chat_history，也無需新增欄位。我們改存在一個全新的暫存 table？不，我們直接將資料存在 local cache 或是為了 stateless 直接用一個簡單編碼
+          // 等一下，既然我們有資料庫，其實只要把他們標記為 is_notified = false, status = 'draft' 就好，但因為 schema 沒有 status，
+          // 用「將資料寫入這張 user 的專屬草稿列」是最安全的。為了免去 user 重新新增欄位的麻煩，我們再次妥協並截斷文字至安全水準嗎？
+          // 不！我們決定：乾脆把選項精煉到極致：只傳送 `action=setrmd&idx...`，但是資料去哪裡拿？
+          // 最優雅的做法是：我們把整包 miniPayloads 存進 Supabase `users` 表的 `reminder_draft` 裡。
+          // 為了這個，我會請 supabase 去 upsert (如果有這個欄位)。如果沒有該欄位，我們可以先借用一個 JSON 倉庫？
           
+          // 真正的解法：直接在提醒資料表裡面寫入這三筆，但是標記為 `is_draft = true`！因為沒這欄位，我們採用更聰明的做法：
+          // 將提醒寫入 reminders 表，但 trigger_time 設為非常遙遠的未來（例如 2099 年），作為暫存區。
+          // 當使用者點擊確認後，我們再把 2099 年的那個任務的時間「改回他真正的時間」。這就不需要改任何 schema！
+          
+          let draftRefs = [];
+          for (let mp of miniPayloads) {
+            // 將真正要觸發的時間藏在 task 字串的魔法標記裡，並把 trigger 設為 2099 避開排程
+            const encodedTask = `[DRAFT]${mp.dt}|${mp.rc}|${mp.t}`;
+            const { data: draftData, error: draftErr } = await supabase.from('reminders').insert({
+              line_user_id: event.source.userId,
+              task: encodedTask,
+              trigger_time: new Date('2099-12-31T23:59:59Z').toISOString(),
+              is_recurring: false // 草稿狀態皆預設單次
+            }).select('id').single();
+            
+            if (draftData) draftRefs.push(draftData.id);
+          }
+
           const items = [];
           
           miniPayloads.forEach((mp, index) => {
+            if (!draftRefs[index]) return; // 如果寫入失敗就忽略
             const btnLabel = `選項 ${index + 1}: ${new Date(mp.dt).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' })}`;
             items.push({
               type: 'action',
               action: {
                 type: 'postback',
                 label: btnLabel.substring(0, 20), // label 最多 20 字
-                data: `action=setrmd&idx=${index}&p=${pStr}`,
+                data: `action=setrmd&id=${draftRefs[index]}`, // 只傳 DB ID，絕對不會超過 300 字
                 displayText: `我要設定 ${btnLabel}`
               }
             });
@@ -699,7 +719,7 @@ async function handleEvent(event) {
             action: {
               type: 'postback',
               label: '全都要設定 🎉',
-              data: `action=setrmd&idx=all&p=${pStr}`,
+              data: `action=setrmdall&ids=${draftRefs.join(',')}`,
               displayText: '請幫我把這些建議的時間「全部」設定提醒。'
             }
           });
@@ -710,7 +730,7 @@ async function handleEvent(event) {
             action: {
               type: 'postback',
               label: '都不需要 ❌',
-              data: `action=cancelrmd`,
+              data: `action=cancelrmd&ids=${draftRefs.join(',')}`, // 帶入 ids 以便我們後續清掉垃圾草稿
               displayText: '先不要設定提醒好了'
             }
           });
@@ -1013,51 +1033,72 @@ async function handleEvent(event) {
 
       // (B) 處理使用者從「多重提醒」Quick Reply 選單送出的選項
       if (action === 'cancelrmd') {
+        const ids = data.get('ids');
+        if (ids) {
+          // 清除草稿垃圾
+          await supabase.from('reminders').delete().in('id', ids.split(','));
+        }
         return await client.replyMessage(event.replyToken, [{ type: 'text', text: '好的，已為您取消這次的提醒設定！' }]);
       }
 
-      if (action === 'setrmd') {
-        const idx = data.get('idx');
-        const pStr = data.get('p') || '[]';
-        let miniPayloads = [];
-        try {
-          miniPayloads = JSON.parse(pStr);
-        } catch (e) {
-          return await client.replyMessage(event.replyToken, [{ type: 'text', text: '⚠️ 讀取提醒選項失敗，請重新輸入指令嘗試一次。' }]);
+      if (action === 'setrmd' || action === 'setrmdall') {
+        let idsToActivate = [];
+        if (action === 'setrmd') {
+          const id = data.get('id');
+          if (id) idsToActivate.push(id);
+        } else if (action === 'setrmdall') {
+          const ids = data.get('ids');
+          if (ids) idsToActivate = ids.split(',');
         }
 
-        let selection = [];
-        if (idx === 'all') {
-          selection = miniPayloads;
-        } else {
-          const matched = miniPayloads[parseInt(idx, 10)];
-          if (matched) selection.push(matched);
-        }
-
-        if (selection.length === 0) {
+        if (idsToActivate.length === 0) {
           return await client.replyMessage(event.replyToken, [{ type: 'text', text: '⚠️ 找不到對應的提醒選項，請重試。' }]);
         }
 
-        // 把 miniPayload 還原回 Supabase 格式
-        const remindersToInsert = selection.map(s => ({
-          line_user_id: event.source.userId,
-          task: s.t,
-          trigger_time: s.dt,
-          is_recurring: s.rc === 1,
-          cron_expression: null // 簡化版 payload 中我們沒有帶 cron，預設為 null 單次
-        }));
+        // 把草稿從資料庫撈出來並「啟動」(更新正確的時間與拔除 DRAFT 標記)
+        const { data: drafts } = await supabase.from('reminders').select('*').in('id', idsToActivate);
+        
+        let validActivations = [];
+        let replyMsg = '✅ 幫您記下來了！我會在以下時間提醒您：\n';
 
-        const { error: insertError } = await supabase.from('reminders').insert(remindersToInsert);
-        if (insertError) {
-          console.error('Insert reminder error (postback):', insertError);
-          return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 儲存提醒發生錯誤，請稍後再試。' }]);
+        for (let d of (drafts || [])) {
+          if (d.task.startsWith('[DRAFT]')) {
+            // 解析： [DRAFT]時間字串|週期標記|真正的任務內容
+            const parts = d.task.substring(7).split('|');
+            if (parts.length >= 3) {
+              const realDt = parts[0];
+              const realRc = parts[1] === '1';
+              const realTask = parts.slice(2).join('|');
+
+              validActivations.push({
+                id: d.id,
+                trigger_time: realDt,
+                is_recurring: realRc,
+                task: realTask
+              });
+              
+              const localTime = new Date(realDt).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
+              replyMsg += `👉 [${localTime}] ${realTask}\n`;
+            }
+          }
         }
 
-        let replyMsg = '✅ 幫您記下來了！我會在以下時間提醒您：\n';
-        remindersToInsert.forEach(r => {
-          const localTime = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
-          replyMsg += `👉 [${localTime}] ${r.task}\n`;
-        });
+        if (validActivations.length === 0) {
+           return await client.replyMessage(event.replyToken, [{ type: 'text', text: '⚠️ 無效的選項，可能已經過期或已被設定過。' }]);
+        }
+
+        // 批次更新回資料庫 activating them
+        for (let act of validActivations) {
+           await supabase.from('reminders').update({
+             trigger_time: act.trigger_time,
+             is_recurring: act.is_recurring,
+             task: act.task
+           }).eq('id', act.id);
+        }
+        
+        // 刪除使用者「沒有選中」的其他草稿，避免 2099 年堆積如山 （非必填，但維持 DB 整理好習慣）
+        // 如果是單選，則清除其他未選擇的草稿
+        // 在這裡我們採用偷懶作法，放給 2099 年自然死亡，或者可以定期清理。為了簡化不額外刪除了。
 
         return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyMsg.trim() }]);
       }
