@@ -836,7 +836,9 @@ async function handleEvent(event) {
 
           if (!user || !user.is_auth_completed || !user.google_refresh_token) {
             const authUrl = `${process.env.GOOGLE_REDIRECT_URI.replace('/oauth2callback', '')}/auth?uid=${event.source.userId}`;
-            systemInstruction = `此用戶尚未授權 Google Drive。無法存取個人記憶。若對話中用戶有記憶需求，請主動且溫和地提供此授權連結請他點擊：${authUrl}`;
+            systemInstruction = `此用戶尚未授權 Google Drive。無法存取個人記憶。若對話中用戶有記憶需求，請「務必使用繁體中文」主動且溫和地提供以下授權連結請他點擊：${authUrl}
+
+🌟 重要提示：請務必在回覆中提醒用戶「不要直接在 LINE 裡面點開」，請「複製連結並切換到外部瀏覽器（如 Google Chrome 或 Apple Safari）」開啟，以確保 Google 授權流程能順利完成。`;
           } else {
             systemInstruction = `你可以使用功能呼叫 \`read_personal_memory\` 與 \`update_personal_memory\` 來管理使用者的專屬中長期記憶。遇到重要資訊時應主動摘要並儲存；被問及過去細節時主動讀取記憶。回答時如同朋友般親切自然。`;
             tools = [{
