@@ -630,6 +630,31 @@ async function handleEvent(event) {
         }
       }
 
+      // 🔧 管理員專屬指令：/notify <lineUserId> <訊息>
+      // 用途：完成 GCP 授權後，直接從 LINE 推播通知給特定用戶
+      // 範例：/notify Uc1d5aec27... 已幫您開通授權，請再點一次連結進行 Google 授權！
+      if (userText.startsWith('/notify') && event.source.userId === process.env.ADMIN_LINE_USER_ID) {
+        const parts = userText.split(' ');
+        const targetUserId = parts[1]; // 第一個參數是目標 LINE User ID
+        const customMsg = parts.slice(2).join(' '); // 之後所有文字是訊息內容
+        
+        // 如果沒有自訂內容，就用預設的授權成功訊息
+        const defaultMsg = `🎉 好消息！\n已為您完成 Google 授權設定。\n\n請使用 Chrome 或 Safari 瀏覽器，再次點擊授權連結，就可以順利完成授權了！\n授權完成後即可使用備忘錄與記憶功能 😊`;
+        const pushMsg = customMsg || defaultMsg;
+        
+        if (!targetUserId) {
+          return await client.replyMessage(event.replyToken, [{ type: 'text', text: '❌ 格式錯誤！請使用：/notify <LINE_USER_ID> <訊息>\n\n範例：\n/notify Uc1d5aec... 已幫您開通授權！' }]);
+        }
+        
+        try {
+          await client.pushMessage(targetUserId, { type: 'text', text: pushMsg });
+          return await client.replyMessage(event.replyToken, [{ type: 'text', text: `✅ 已成功推播通知給用戶！\n👤 ${targetUserId}` }]);
+        } catch (pushErr) {
+          console.error('[Admin /notify] Push failed:', pushErr.message);
+          return await client.replyMessage(event.replyToken, [{ type: 'text', text: `❌ 推播失敗，請確認 LINE User ID 是否正確。\n錯誤：${pushErr.message}` }]);
+        }
+      }
+
       // 處理 /model 指令
       if (userText.startsWith('/model')) {
         const args = userText.split(' ');
