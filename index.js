@@ -652,10 +652,10 @@ async function handleEvent(event) {
         else if (parsedData.intent === 'CHAT') {
           // 一般聊天回覆與個人記憶庫功能 (Function Calling)
 
-          // 確認授權狀態
+          // 확인授權狀態與短期記憶
           const { data: user } = await supabase
             .from('users')
-            .select('google_refresh_token, is_auth_completed')
+            .select('google_refresh_token, is_auth_completed, chat_history')
             .eq('line_user_id', event.source.userId)
             .single();
 
@@ -694,9 +694,17 @@ async function handleEvent(event) {
           const chatConfig = { systemInstruction };
           if (tools) chatConfig.tools = tools;
 
+          // 注入短期記憶 (chat_history)
+          const history = Array.isArray(user?.chat_history) ? user.chat_history : [];
+          const geminiHistoryFormat = history.map(h => ({
+            role: h.role,
+            parts: [{ text: h.text }]
+          }));
+
           const chat = ai.chats.create({
             model: targetModel,
-            config: chatConfig
+            config: chatConfig,
+            history: geminiHistoryFormat
           });
 
           let chatResponse = await chat.sendMessage({ message: userText });
@@ -725,6 +733,16 @@ async function handleEvent(event) {
           }
 
           const replyText = chatResponse.text || '好的，我記下來了！';
+
+          // 更新短期記憶 (只保留最後 10 次對話 = 20筆 role)
+          const newHistory = [
+            ...history,
+            { role: 'user', text: userText },
+            { role: 'model', text: replyText }
+          ].slice(-20); // 保留最近 20 筆紀錄
+
+          await supabase.from('users').update({ chat_history: newHistory }).eq('line_user_id', event.source.userId);
+
           return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyText }]);
         }
       }
@@ -746,7 +764,7 @@ async function handleEvent(event) {
         const base64Image = imageBuffer.toString('base64');
 
         // 準備送給 Gemini 的 Prompt
-        const prompt = '請發揮你身為頂尖 AI 的觀察力，詳細地用繁體中文描述這張圖片裡有什麼？請用自然、友善的語氣。';
+        const prompt = '請判斷這張圖片的主要內容。如果是文件或單據，請幫我萃取重點資訊；如果是物品或場景，請說明核心主題即可，不需要描述無關緊要的背景細節（例如手、桌面等）。請用繁體中文、自然友善的語氣回覆。';
 
         // 查詢用戶設定的偏好模型 (圖片分析偏向複雜理解，預設使用 3-flash-preview)
         const { data: userSetting } = await supabase

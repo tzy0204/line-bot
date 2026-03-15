@@ -83,6 +83,7 @@
 | `google_refresh_token`  | `text`    | Google OAuth 的 Refresh Token |
 | `is_auth_completed`     | `boolean` | 是否完成 Google 授權            |
 | `message_count`         | `int4`    | 推算 API 成本用的訊息總量計數     |
+| `chat_history`          | `jsonb`   | 儲存最後 10 次的對話上下文記憶     |
 
 **`reminders` 表：**
 | Column            | Type          | Notes                        |
