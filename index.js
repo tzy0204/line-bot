@@ -639,7 +639,7 @@ async function handleEvent(event) {
         const customMsg = parts.slice(2).join(' '); // 之後所有文字是訊息內容
         
         // 如果沒有自訂內容，就用預設的授權成功訊息
-        const defaultMsg = `🎉 好消息！\n已為您完成 Google 授權設定。\n\n請使用 Chrome 或 Safari 瀏覽器，再次點擊授權連結，就可以順利完成授權了！\n授權完成後即可使用備忘錄與記憶功能 😊`;
+        const defaultMsg = '🎉 好消息！\n已為您完成 Google 授權設定。\n\n請使用 Chrome 或 Safari 瀏覽器，再次點擊授權連結，就可以順利完成授權了！\n授權完成後即可使用備忘錄與記憶功能 😊';
         const pushMsg = customMsg || defaultMsg;
         
         if (!targetUserId) {
