@@ -655,7 +655,55 @@ async function handleEvent(event) {
         }
       }
 
-      // 處理 /model 指令
+      // 🔧 管理員專屬指令：/notifyall <公告內容>
+      // 用途：廣播版本更新或緊急通知給所有已註冊的機器人用戶
+      // 範例：/notifyall 🚀 機器人已更新至 v2.0，新增語音提醒功能！
+      if (userText.startsWith('/notifyall') && event.source.userId === process.env.ADMIN_LINE_USER_ID) {
+        const announcement = userText.replace('/notifyall', '').trim();
+        
+        if (!announcement) {
+          return await client.replyMessage(event.replyToken, [{ type: 'text', text: '❌ 請提供公告內容！\n\n範例：\n/notifyall 🚀 機器人已更新至新版本，新增語音提醒功能！' }]);
+        }
+
+        // 先回覆管理員「正在廣播中」，釋放 replyToken
+        await client.replyMessage(event.replyToken, [{ type: 'text', text: `📢 正在廣播通知給所有用戶，請稍候...` }]);
+
+        // 從資料庫取得所有用戶 ID
+        const { data: allUsers, error: fetchErr } = await supabase
+          .from('users')
+          .select('line_user_id');
+        
+        if (fetchErr || !allUsers?.length) {
+          await client.pushMessage(event.source.userId, { type: 'text', text: '❌ 無法取得用戶清單，廣播失敗。' });
+          return;
+        }
+
+        // 組合完整公告訊息
+        const fullMsg = '📢 【系統公告】\n\n' + announcement + '\n\n─────────────\n如有任何問題，歡迎直接在機器人對話中提問！';
+
+        // 逐一發送推播（加入小延遲避免觸發 LINE API 速率限制）
+        let successCount = 0;
+        let failCount = 0;
+        for (const user of allUsers) {
+          try {
+            await client.pushMessage(user.line_user_id, { type: 'text', text: fullMsg });
+            successCount++;
+          } catch (e) {
+            failCount++;
+            console.error(`[notifyall] Failed to push to ${user.line_user_id}:`, e.message);
+          }
+          await new Promise(res => setTimeout(res, 50)); // 50ms 間隔避免超量
+        }
+
+        // 廣播完成後通知管理員結果
+        await client.pushMessage(event.source.userId, {
+          type: 'text',
+          text: `✅ 廣播完成！\n\n📊 結果統計：\n✅ 成功：${successCount} 人\n❌ 失敗：${failCount} 人\n📢 公告內容：\n${announcement}`
+        });
+        return;
+      }
+
+
       if (userText.startsWith('/model')) {
         const args = userText.split(' ');
         const option = args[1] ? args[1].toLowerCase() : null;
