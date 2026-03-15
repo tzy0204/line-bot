@@ -555,13 +555,15 @@ async function handleEvent(event) {
 
 【意圖 1：CREATE (建立提醒)】
 如果使用者要求「設定提醒事項」或「定時叫我做某事」，請進一步判斷這是一個「單次提醒」還是「週期性提醒」。
-🌟 重要指示：若使用者是要為某個「未來事件（例如：看診、開會、約會）」設定提醒，請主動為他規劃 2 個合適的提醒時間點（例如：前一天晚上 8 點提醒準備、當天提早 1 小時出發前提醒），並將這些設計好的提醒全部分別放進陣列中回傳。
+🌟 重要指示：
+1. 若使用者是要為某個「未來事件（例如：看診、開會、約會）」設定提醒，請主動為他規劃 2 個合適的提醒時間點（例如：前一天晚上 8 點提醒準備、當天提早 1 小時出發前提醒），並將這些設計好的提醒全部分別放進陣列中回傳。
+2. 針對 task 的內容，必須「鉅細靡遺地」擷取上下文（例如剛才的文檔或圖片分析結果）中的重要訊息。如果找得到：【確切日期與時段】、【診號/掛號序號/房號】、【聯絡電話】、【網址 URL】、【地址】，請務必全部寫進 task 字串中，不要漏掉。
 推算邏輯請以台灣時間為準，並回傳以下嚴格的 JSON 格式：
 {
   "intent": "CREATE",
   "reminders": [
     {
-      "task": "提醒的具體事情（例如：回診打疫苗、提前一天準備證件、去健身）",
+      "task": "提醒的具體事情與所有重要細節（例如：明天早上9點去周伯翰診所回診，診號 15號，電話 03-6583289，請記得帶健保卡！）",
       "triggerTime": "ISO 8601 格式的 UTC 時間字串，代表『下一次』要觸發的時間（例如：2024-05-15T12:00:00.000Z，需轉成 UTC）",
       "isRecurring": true 或 false,
       "cronExpression": "如果是週期性提醒，提供標準的 cron 表示式字串(分 時 日 月 星期)，時區以 UTC 計算。若非週期性請填 null"
@@ -661,11 +663,20 @@ async function handleEvent(event) {
           // 若擔心過長，也可以暫存至 DB，這裏示範「直接帶精簡 JSON 走 Payload」的方式，因為我們只傳「索引」加上「核心屬性」
           
           // 將提醒縮短成精練版本放進 payload (確保小於 300字元)
-          const miniPayloads = remindersToInsert.map(r => ({
-            t: r.task.substring(0, 15), // 截斷過長文字
+          // 由於我們剛才加強了 Prompt 要擷取大量細節，此處若無腦截斷 15 字會流失資訊
+          // 我們可以先試著保留更長的內容，如果最終 stringify 後總長度逼近 300，再進行縮減
+          let miniPayloads = remindersToInsert.map(r => ({
+            t: r.task.substring(0, 100), // 初步截斷到 100 字
             dt: r.trigger_time,
             rc: r.is_recurring ? 1 : 0
           }));
+          
+          let pStr = JSON.stringify(miniPayloads);
+          if (pStr.length > 250) {
+            // 如果超過安全長度，再次進行強制縮減
+            miniPayloads = miniPayloads.map(mp => ({ ...mp, t: mp.t.substring(0, 30) }));
+            pStr = JSON.stringify(miniPayloads);
+          }
           
           const items = [];
           
@@ -676,7 +687,7 @@ async function handleEvent(event) {
               action: {
                 type: 'postback',
                 label: btnLabel.substring(0, 20), // label 最多 20 字
-                data: `action=setrmd&idx=${index}&p=${JSON.stringify(miniPayloads)}`,
+                data: `action=setrmd&idx=${index}&p=${pStr}`,
                 displayText: `我要設定 ${btnLabel}`
               }
             });
@@ -688,7 +699,7 @@ async function handleEvent(event) {
             action: {
               type: 'postback',
               label: '全都要設定 🎉',
-              data: `action=setrmd&idx=all&p=${JSON.stringify(miniPayloads)}`,
+              data: `action=setrmd&idx=all&p=${pStr}`,
               displayText: '請幫我把這些建議的時間「全部」設定提醒。'
             }
           });
