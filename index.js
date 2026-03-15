@@ -1027,6 +1027,15 @@ async function handleEvent(event) {
                 data: `action=translate&msgId=${event.message.id}`,
                 displayText: '請幫我將這段語音翻譯成英文'
               }
+            },
+            {
+              type: 'action',
+              action: {
+                type: 'postback',
+                label: '⏰ 設定提醒',
+                data: `action=remindervoc&msgId=${event.message.id}`,
+                displayText: '請根據這段語音幫我設定提醒事項'
+              }
             }
           ]
         }
@@ -1038,9 +1047,9 @@ async function handleEvent(event) {
       const data = new URLSearchParams(event.postback.data);
       const action = data.get('action');
 
-      // (A) 處理語音潤飾 / 翻譯
+      // (A) 處理語音潤飾 / 翻譯 / 語音提醒
       const msgId = data.get('msgId');
-      if ((action === 'polish' || action === 'translate') && msgId) {
+      if ((action === 'polish' || action === 'translate' || action === 'remindervoc') && msgId) {
         // 從 LINE 伺服器下載語音檔案
         const stream = await client.getMessageContent(msgId);
         const chunks = [];
@@ -1050,7 +1059,112 @@ async function handleEvent(event) {
         const audioBuffer = Buffer.concat(chunks);
         const base64Audio = audioBuffer.toString('base64');
 
-        // 準備 Gemini Prompt
+        // 查詢用戶設定的偏好模型
+        const { data: userSetting } = await supabase
+          .from('users')
+          .select('selected_model')
+          .eq('line_user_id', event.source.userId)
+          .single();
+        const targetModel = userSetting?.selected_model || 'gemini-3-flash-preview';
+
+        // --- 語音提醒：先轉寫，再走提醒意圖分析流程 ---
+        if (action === 'remindervoc') {
+          // 第一步：先把語音轉寫成乾淨的文字
+          const transcribePrompt = `請仔細聆聽這段語音並將其轉寫成文字。說話者可能會有口吃、停頓、語助詞，或自我修正。請準確理解最終想表達的意思，去除冗詞，整理成通順的中文句子。直接輸出轉寫結果即可，不需要任何解釋。`;
+          const transcribeResponse = await ai.models.generateContent({
+            model: targetModel,
+            contents: [transcribePrompt, { inlineData: { data: base64Audio, mimeType: 'audio/mp4' } }]
+          });
+          const transcribedText = transcribeResponse.text?.trim() || '';
+
+          if (!transcribedText) {
+            return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 無法辨識這段語音，請再試一次。' }]);
+          }
+
+          // 第二步：將轉寫的文字送入意圖分析 (等同使用者打字說了這句話)
+          const now = new Date();
+          const nowStr = now.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
+
+          // 取出對話上下文
+          const { data: userContext } = await supabase
+            .from('users')
+            .select('chat_history')
+            .eq('line_user_id', event.source.userId)
+            .single();
+          let contextStr = '';
+          if (userContext && Array.isArray(userContext.chat_history) && userContext.chat_history.length > 0) {
+            const recentHistory = userContext.chat_history.slice(-4);
+            contextStr = '【近期對話上下文】\n' + recentHistory.filter(h => h && h.role && h.text).map(h => `${h.role === 'user' ? '使用者' : 'AI'}: ${h.text}`).join('\n') + '\n\n';
+          }
+
+          const intentPrompt = `${contextStr}【最新訊息】\n使用者說了一句話：「${transcribedText}」
+
+請分析這句【最新訊息】的意圖，現在的台灣時間是：${nowStr}
+
+【意圖 1：CREATE (建立提醒)】
+如果使用者要求「設定提醒事項」或「定時叫我做某事」，請進一步判斷這是一個「單次提醒」還是「週期性提醒」。
+🌟 重要指示：
+1. 若語意中包含「未來事件」，請主動為使用者規劃以下 2 種提醒時間點選項：
+   (a) 彈性時段：若事件在下午或晚上，當天上午提醒；若事件在上午，前一天晚上提醒。
+   (b) 提前 2 小時提醒。
+2. 針對 task 的內容，必須擷取所有重要細節（日期、地點、事項）放入字串中。
+回傳以下嚴格的 JSON 格式（不要有任何其他內容）：
+{
+  "intent": "CREATE",
+  "reminders": [
+    {
+      "task": "提醒的具體事情與所有重要細節",
+      "triggerTime": "ISO 8601 UTC 時間字串",
+      "isRecurring": false,
+      "cronExpression": null
+    }
+  ]
+}`;
+
+          const intentResponse = await ai.models.generateContent({ model: targetModel, contents: intentPrompt });
+          let intentParsed = null;
+          try {
+            const jsonStr = intentResponse.text.replace(/^\`\`\`json/m, '').replace(/\`\`\`$/m, '').trim();
+            if (jsonStr.startsWith('{')) intentParsed = JSON.parse(jsonStr);
+          } catch (e) { /* 略過解析錯誤 */ }
+
+          if (!intentParsed || intentParsed.intent !== 'CREATE' || !intentParsed.reminders?.length) {
+            await saveChatHistory(event.source.userId, `[語音提醒] ${transcribedText}`, '無法理解提醒意圖');
+            return await client.replyMessage(event.replyToken, [{ type: 'text', text: `🎙️ 我聽到您說：「${transcribedText}」\n\n😅 不太確定您想設定什麼提醒，可以再說清楚一點嗎？例如：「明天下午三點提醒我去看骨科」` }]);
+          }
+
+          // 確保使用者存在
+          await supabase.from('users').upsert({ line_user_id: event.source.userId }, { onConflict: 'line_user_id', ignoreDuplicates: true });
+
+          const remindersToInsert = intentParsed.reminders.filter(r => r.task && r.triggerTime).map(r => ({
+            line_user_id: event.source.userId,
+            task: r.task,
+            trigger_time: new Date(r.triggerTime).toISOString(),
+            is_recurring: r.isRecurring || false,
+            cron_expression: r.cronExpression || null
+          }));
+
+          if (remindersToInsert.length === 0) {
+            return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 無法解析提醒內容，請再試一次。' }]);
+          }
+
+          await saveChatHistory(event.source.userId, `[語音提醒] ${transcribedText}`, `已為您設定 ${remindersToInsert.length} 個提醒選項`);
+
+          // 直接存入 (單筆) 或彈出選單 (多筆)
+          if (remindersToInsert.length === 1) {
+            const { error: insertError } = await supabase.from('reminders').insert(remindersToInsert);
+            if (insertError) return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 儲存提醒失敗，請稍後再試。' }]);
+            const r = remindersToInsert[0];
+            const localTime = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
+            return await client.replyMessage(event.replyToken, [{ type: 'text', text: `🎙️ 我聽到您說：「${transcribedText}」\n\n✅ 幫您記下來了！\n👉 [${localTime}] ${r.task}` }]);
+          }
+
+          const qrMessage = await generateReminderQuickReplyMessage(event.source.userId, remindersToInsert);
+          qrMessage.text = `🎙️ 我聽到您說：「${transcribedText}」\n\n${qrMessage.text}`;
+          return await client.replyMessage(event.replyToken, [qrMessage]);
+        }
+
+        // --- 潤飾 / 翻譯 路徑 ---
         const prompt = action === 'polish'
           ? `請仔細聆聽這段語音並將其轉寫成文字。說話者可能會有口吃、停頓、無意義的語助詞（嗯、啊等），或者在說話過程中進行「自我修正」（例如：「禮拜二想吃橘子...不對，禮拜二我想吃香蕉」）。
           請你：
@@ -1064,14 +1178,6 @@ async function handleEvent(event) {
           2. 去除所有的口語贅詞、猶豫與停頓。
           3. 將零碎的語句重新調整，組成通順且邏輯連貫的英文句子。
           4. 最後再精煉並潤飾文字，使其讀起來非常自然流暢，直接輸出最終的英文翻譯結果即可，不要包含任何解釋或多餘的回覆。`;
-
-        // 查詢用戶設定的偏好模型 (如果沒設定，語音潤飾預設使用更聰明的 3-flash-preview)
-        const { data: userSetting } = await supabase
-          .from('users')
-          .select('selected_model')
-          .eq('line_user_id', event.source.userId)
-          .single();
-        const targetModel = userSetting?.selected_model || 'gemini-3-flash-preview';
 
         // 傳送給 Gemini 處理
         const response = await ai.models.generateContent({
