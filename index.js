@@ -794,9 +794,11 @@ async function handleEvent(event) {
 }
 
 【意圖 2：QUERY (查詢提醒)】
-如果使用者詢問接下來有哪些提醒（例如：「本週有哪些提醒」、「我有設定什麼提醒嗎」），請回傳以下 JSON 格式：
+如果使用者詢問接下來有哪些提醒（例如：「本週有哪些提醒」、「我有設定什麼提醒嗎」、「下次看醫生是什麼時候」），請回傳以下 JSON 格式：
 {
-  "intent": "QUERY"
+  "intent": "QUERY",
+  "searchKeywords": "語意關鍵字（若使用者有指定特定類型，如「看醫生」「回診」「健身」，請填入；若沒有特定類型則填 null）",
+  "timeRef": "時間參考（若有，例如：'最近'/'下週'/'本月'/'下個月'，填入中文描述；若沒有特別限定填 null）"
 }
 
 【意圖 3：CANCEL (取消提醒)】
@@ -884,30 +886,80 @@ async function handleEvent(event) {
           return await client.replyMessage(event.replyToken, [replyMessage]);
         }
         else if (parsedData.intent === 'QUERY') {
-          // 查詢本週提醒 (未來 7 天內)
-          const start = new Date();
-          const end = new Date();
-          end.setDate(end.getDate() + 7);
-
-          const { data: reminders, error: queryError } = await supabase
+          // 取出所有未來未完成的提醒（最多 200 筆）
+          const { data: allReminders, error: queryError } = await supabase
             .from('reminders')
             .select('*')
             .eq('line_user_id', event.source.userId)
             .eq('is_notified', false)
-            .gte('trigger_time', start.toISOString())
-            .lte('trigger_time', end.toISOString())
-            .order('trigger_time', { ascending: true });
+            .gte('trigger_time', new Date().toISOString())
+            .not('task', 'like', '[DRAFT]%') // 排除未確認的草稿
+            .order('trigger_time', { ascending: true })
+            .limit(200);
 
-          if (queryError || !reminders || reminders.length === 0) {
-            return await client.replyMessage(event.replyToken, [{ type: 'text', text: '📅 未來七天內，您目前沒有任何已設定的提醒事項喔！' }]);
+          if (queryError || !allReminders || allReminders.length === 0) {
+            return await client.replyMessage(event.replyToken, [{ type: 'text', text: '📅 您目前沒有任何已設定的提醒事項喔！' }]);
           }
 
-          let replyStr = '📅 【未來七天提醒事項】\n\n';
-          reminders.forEach((r, index) => {
+          // 把提醒清單整理成 AI 可讀格式
+          const nowStr = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
+          const reminderListStr = allReminders.map((r, i) => {
+            const t = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
+            return `[${i}] ${t} → ${r.task}`;
+          }).join('\n');
+
+          // 使用 AI 進行語意篩選與排序
+          const hasFilter = parsedData.searchKeywords || parsedData.timeRef;
+          let filteredReminders = allReminders;
+
+          if (hasFilter) {
+            const semanticPrompt = `現在台灣時間是：${nowStr}
+使用者問的問題是：「${userText}」
+關鍵字提示：${parsedData.searchKeywords || '無'}
+時間範圍提示：${parsedData.timeRef || '無'}
+
+以下是使用者的所有未來提醒清單（格式：[索引] 時間 → 事項）：
+${reminderListStr}
+
+請從中找出最符合使用者問題的提醒事項（語意匹配，不需要完全相符），並依照相關性由高至低排序。
+回傳一個嚴格的 JSON 陣列，只包含符合的索引值（例如：[0, 3, 5]）。
+若沒有任何符合的，回傳空陣列 []。
+只回傳 JSON，不要其他文字。`;
+
+            try {
+              const semanticResp = await ai.models.generateContent({ model: targetModel, contents: semanticPrompt });
+              const idxStr = semanticResp.text.replace(/^\`\`\`json/m, '').replace(/\`\`\`$/m, '').trim();
+              const idxArr = JSON.parse(idxStr);
+              if (Array.isArray(idxArr) && idxArr.length > 0) {
+                filteredReminders = idxArr.map(i => allReminders[i]).filter(Boolean);
+              } else {
+                filteredReminders = []; // AI 找不到符合的
+              }
+            } catch (e) {
+              // 語意篩選失敗時，退回到全表顯示前 10 筆
+              filteredReminders = allReminders.slice(0, 10);
+            }
+          }
+
+          if (filteredReminders.length === 0) {
+            const noResultMsg = parsedData.searchKeywords
+              ? `📅 找不到與「${parsedData.searchKeywords}」相關的提醒事項。\n\n您可以試試查詢「所有提醒」來瀏覽完整清單。`
+              : '📅 您目前沒有任何已設定的提醒事項喔！';
+            return await client.replyMessage(event.replyToken, [{ type: 'text', text: noResultMsg }]);
+          }
+
+          // 組合回覆訊息
+          const titleLabel = parsedData.searchKeywords
+            ? `📅 【${parsedData.searchKeywords}相關提醒】`
+            : '📅 【提醒事項】';
+          
+          let replyStr = titleLabel + '\n\n';
+          filteredReminders.slice(0, 10).forEach((r, index) => { // 最多顯示 10 筆
             const timeStr = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
             const recurStr = r.is_recurring ? ' (🔄週期)' : '';
             replyStr += `${index + 1}. ${timeStr}\n👉 ${r.task}${recurStr}\n\n`;
           });
+          if (filteredReminders.length > 10) replyStr += `...還有 ${filteredReminders.length - 10} 筆，輸入更具體的條件可縮小範圍。`;
 
           return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyStr.trim() }]);
         }
