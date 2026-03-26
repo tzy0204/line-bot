@@ -597,6 +597,26 @@ async function handleEvent(event) {
     if (event.type === 'message' && event.message.type === 'text') {
       const userText = event.message.text.trim();
 
+      // --- 🗞️ 今日晨報 — 從 Supabase 拉取 my_agent 採集的每日晨報 ---
+      // 使用者輸入「晨報」或「今日新聞」時，直接回覆，不經過 AI 意圖判斷，節省 Token
+      if (userText.includes('晨報') || userText.includes('今日新聞') || userText.includes('早報')) {
+        const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Taipei' }); // 'YYYY-MM-DD'
+        const { data: newsRow, error: newsErr } = await supabase
+          .from('daily_news')
+          .select('content')
+          .eq('date', today)
+          .single();
+
+        const newsContent = newsRow?.content;
+        if (newsContent) {
+          await saveChatHistory(event.source.userId, userText, newsContent);
+          return await client.replyMessage(event.replyToken, [{ type: 'text', text: newsContent }]);
+        } else {
+          const notReadyMsg = '☕ 今日晨報還在準備中，請稍後再試！\n（晨報通常於每天早上 06:30 整理完畢）';
+          return await client.replyMessage(event.replyToken, [{ type: 'text', text: notReadyMsg }]);
+        }
+      }
+
       // --- 🛡️ 測試人員 Email 自動收集邏輯 ---
       // 若內容看起來像 Gmail 且用戶尚未完成授權，自動紀錄以便管理員加入 GCP 測試人員名單
       const gmailRegex = /([a-zA-Z0-9._-]+@gmail\.com)/i;
