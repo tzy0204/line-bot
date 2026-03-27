@@ -36,6 +36,20 @@ const app = express();
 // 共用函數分享區
 // ==========================================
 
+// 寫入系統日誌 (Non-blocking) 給 Dashboard 使用
+async function logToSupabase(taskType, status, message) {
+  try {
+    await supabase.from('system_logs').insert({
+      service: '咚咚',
+      task_type: taskType,
+      status: status,
+      message: message
+    });
+  } catch (err) {
+    console.error('[Supabase Logger] ❌ 寫入 log 失敗:', err);
+  }
+}
+
 // 將對話上下文存入 Supabase (維持最新 10 次對答，即 20 筆訊息)
 async function saveChatHistory(userId, userText, modelText) {
 
@@ -523,11 +537,14 @@ app.post('/webhook', line.middleware(config), (req, res) => {
     .all(req.body.events.map(handleEvent))
     .then((result) => res.json(result))
     .catch((err) => {
+      let errMsg = err.message || err;
       if (err.response) {
-        console.error('LINE API Error:', JSON.stringify(err.response.data, null, 2));
+        errMsg = JSON.stringify(err.response.data, null, 2);
+        console.error('LINE API Error:', errMsg);
       } else {
-        console.error('Webhook Error:', err.message || err);
+        console.error('Webhook Error:', errMsg);
       }
+      logToSupabase('Error', 'Error', `Webhook Error: ${errMsg}`).catch(console.error);
       res.status(500).end();
     });
 });
@@ -535,6 +552,9 @@ app.post('/webhook', line.middleware(config), (req, res) => {
 // event handler
 async function handleEvent(event) {
   console.log('Received event:', JSON.stringify(event, null, 2));
+  
+  // 非同步紀錄收到事件
+  logToSupabase('Webhook', 'Info', `Received event: ${event.type}`).catch(console.error);
 
   // --- Track Message Usage ---
   if (event.type === 'message') {
@@ -761,13 +781,17 @@ async function handleEvent(event) {
 
         if (upsertError) {
           console.error('Error updating user model:', upsertError);
-          return await client.replyMessage(event.replyToken, [{ type: 'text', text: '❌ 儲存模型設定失敗，請稍後再試。' }]);
+          await client.replyMessage(event.replyToken, [{ type: 'text', text: '❌ 儲存模型設定失敗，請稍後再試。' }]);
+          logToSupabase('Webhook', 'Error', `Failed to update model for user ${event.source.userId} to ${newModel}`, event.source.userId, upsertError).catch(console.error);
+          return;
         }
 
-        return await client.replyMessage(event.replyToken, [{
+        await client.replyMessage(event.replyToken, [{
           type: 'text',
           text: `✅ 已成功為你切換至 ${newModel} 模型！`
         }]);
+        logToSupabase('Webhook', 'Success', `User ${event.source.userId} switched model to ${newModel}`, event.source.userId).catch(console.error);
+        return;
       }
 
       const now = new Date();
@@ -861,7 +885,9 @@ async function handleEvent(event) {
         }
       } catch (e) {
         // 解析失敗，當作一般回覆
-        return await client.replyMessage(event.replyToken, [{ type: 'text', text: responseText }]);
+        await client.replyMessage(event.replyToken, [{ type: 'text', text: responseText }]);
+        logToSupabase('Webhook', 'Success', `Replied to user ${event.source.userId} with AI response (JSON parse failed)`, event.source.userId).catch(console.error);
+        return;
       }
 
       if (parsedData) {
@@ -883,7 +909,9 @@ async function handleEvent(event) {
           }));
 
           if (remindersToInsert.length === 0) {
-            return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 無法解析提醒內容，請重新檢查您的描述。' }]);
+            await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 無法解析提醒內容，請重新檢查您的描述。' }]);
+            logToSupabase('Webhook', 'Error', `CREATE intent failed for user ${event.source.userId}: no valid reminders`, event.source.userId).catch(console.error);
+            return;
           }
 
           // 如果只有單筆提醒，直接存入並回覆
@@ -891,19 +919,25 @@ async function handleEvent(event) {
             const { error: insertError } = await supabase.from('reminders').insert(remindersToInsert);
             if (insertError) {
               console.error('Insert reminder error:', insertError);
-              return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 儲存提醒發生錯誤，請稍後再試。' }]);
+              await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 儲存提醒發生錯誤，請稍後再試。' }]);
+              logToSupabase('Webhook', 'Error', `CREATE intent failed for user ${event.source.userId}: DB insert error`, event.source.userId, insertError).catch(console.error);
+              return;
             }
             const r = remindersToInsert[0];
             const localTime = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
-            return await client.replyMessage(event.replyToken, [{
+            await client.replyMessage(event.replyToken, [{
               type: 'text',
               text: `✅ 幫您記下來了！\n\n我會在以下時間提醒您：\n👉 [${localTime}] ${r.task}`
             }]);
+            logToSupabase('Webhook', 'Success', `CREATE intent single reminder for user ${event.source.userId}`, event.source.userId).catch(console.error);
+            return;
           }
 
           // 如果有多筆建議，彈出 Quick Reply 選單讓使用者決定
           const replyMessage = await generateReminderQuickReplyMessage(event.source.userId, remindersToInsert);
-          return await client.replyMessage(event.replyToken, [replyMessage]);
+          await client.replyMessage(event.replyToken, [replyMessage]);
+          logToSupabase('Webhook', 'Success', `CREATE intent multiple reminders for user ${event.source.userId}`, event.source.userId).catch(console.error);
+          return;
         }
         else if (parsedData.intent === 'QUERY') {
           // 取出所有未來未完成的提醒（最多 200 筆）
@@ -918,7 +952,9 @@ async function handleEvent(event) {
             .limit(200);
 
           if (queryError || !allReminders || allReminders.length === 0) {
-            return await client.replyMessage(event.replyToken, [{ type: 'text', text: '📅 您目前沒有任何已設定的提醒事項喔！' }]);
+            await client.replyMessage(event.replyToken, [{ type: 'text', text: '📅 您目前沒有任何已設定的提醒事項喔！' }]);
+            logToSupabase('Webhook', 'Success', `QUERY intent for user ${event.source.userId}: no reminders found`, event.source.userId).catch(console.error);
+            return;
           }
 
           // 把提醒清單整理成 AI 可讀格式
@@ -956,6 +992,8 @@ ${reminderListStr}
                 filteredReminders = []; // AI 找不到符合的
               }
             } catch (e) {
+              console.error('Semantic filtering failed:', e);
+              logToSupabase('Webhook', 'Error', `QUERY intent semantic filtering failed for user ${event.source.userId}`, event.source.userId, e).catch(console.error);
               // 語意篩選失敗時，退回到全表顯示前 10 筆
               filteredReminders = allReminders.slice(0, 10);
             }
@@ -965,7 +1003,9 @@ ${reminderListStr}
             const noResultMsg = parsedData.searchKeywords
               ? `📅 找不到與「${parsedData.searchKeywords}」相關的提醒事項。\n\n您可以試試查詢「所有提醒」來瀏覽完整清單。`
               : '📅 您目前沒有任何已設定的提醒事項喔！';
-            return await client.replyMessage(event.replyToken, [{ type: 'text', text: noResultMsg }]);
+            await client.replyMessage(event.replyToken, [{ type: 'text', text: noResultMsg }]);
+            logToSupabase('Webhook', 'Success', `QUERY intent for user ${event.source.userId}: no filtered results`, event.source.userId).catch(console.error);
+            return;
           }
 
           // 組合回覆訊息
@@ -981,7 +1021,9 @@ ${reminderListStr}
           });
           if (filteredReminders.length > 10) replyStr += `...還有 ${filteredReminders.length - 10} 筆，輸入更具體的條件可縮小範圍。`;
 
-          return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyStr.trim() }]);
+          await client.replyMessage(event.replyToken, [{ type: 'text', text: replyStr.trim() }]);
+          logToSupabase('Webhook', 'Success', `QUERY intent for user ${event.source.userId}: replied with ${filteredReminders.length} reminders`, event.source.userId).catch(console.error);
+          return;
         }
         else if (parsedData.intent === 'CANCEL' && parsedData.cancelTarget) {
           // 取消提醒 (Supabase text search: ilike '%' || keyword || '%')
@@ -994,15 +1036,19 @@ ${reminderListStr}
             .select(); // 取得被刪除的筆數
 
           if (!deleteError && deletedResult && deletedResult.length > 0) {
-            return await client.replyMessage(event.replyToken, [{ type: 'text', text: `🗑️ 已經為您取消了 ${deletedResult.length} 筆與「${parsedData.cancelTarget}」相關的提醒。` }]);
+            await client.replyMessage(event.replyToken, [{ type: 'text', text: `🗑️ 已經為您取消了 ${deletedResult.length} 筆與「${parsedData.cancelTarget}」相關的提醒。` }]);
+            logToSupabase('Webhook', 'Success', `CANCEL intent for user ${event.source.userId}: cancelled ${deletedResult.length} reminders`, event.source.userId).catch(console.error);
+            return;
           } else {
-            return await client.replyMessage(event.replyToken, [{ type: 'text', text: `👀 找不到與「${parsedData.cancelTarget}」相關的有效提醒喔！您可以先查詢目前的提醒清單再試試看。` }]);
+            await client.replyMessage(event.replyToken, [{ type: 'text', text: `👀 找不到與「${parsedData.cancelTarget}」相關的有效提醒喔！您可以先查詢目前的提醒清單再試試看。` }]);
+            logToSupabase('Webhook', 'Success', `CANCEL intent for user ${event.source.userId}: no reminders found for target ${parsedData.cancelTarget}`, event.source.userId).catch(console.error);
+            return;
           }
         }
         else if (parsedData.intent === 'CHAT') {
           // 一般聊天回覆與個人記憶庫功能 (Function Calling)
 
-          // 확인授權狀態與短期記憶
+          // 確認授權狀態與短期記憶
           const { data: user } = await supabase
             .from('users')
             .select('google_refresh_token, is_auth_completed, chat_history')
@@ -1080,12 +1126,14 @@ ${reminderListStr}
             const functionArgs = call.args;
 
             console.log(`Executing tool: ${functionName}`, functionArgs);
+            logToSupabase('FunctionCall', 'Info', `Executing tool: ${functionName}`, event.source.userId, functionArgs).catch(console.error);
 
             let apiResponse;
             if (memoryFunctions[functionName] && user.google_refresh_token) {
-              apiResponse = await memoryFunctions[functionName](functionArgs, user.google_refresh_token);
+              apiResponse = await memoryFunctions[functionName]({ ...functionArgs, line_user_id: event.source.userId }, user.google_refresh_token);
             } else {
               apiResponse = { error: '未知的函數或尚未授權 Google' };
+              logToSupabase('FunctionCall', 'Error', `Function call failed: unknown function or not authorized`, event.source.userId, { functionName, args: functionArgs }).catch(console.error);
             }
 
             // 將函數執行結果送回給模型，讓模型產出最終的文字回覆
@@ -1101,12 +1149,16 @@ ${reminderListStr}
           // 更新短期記憶
           await saveChatHistory(event.source.userId, userText, replyText);
 
-          return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyText }]);
+          await client.replyMessage(event.replyToken, [{ type: 'text', text: replyText }]);
+          logToSupabase('Webhook', 'Success', `CHAT intent for user ${event.source.userId}: replied with AI response`, event.source.userId).catch(console.error);
+          return;
         }
       }
 
       // Fallback
-      return await client.replyMessage(event.replyToken, [{ type: 'text', text: '抱歉，我不太懂您的意思，請再說一次。' }]);
+      await client.replyMessage(event.replyToken, [{ type: 'text', text: '抱歉，我不太懂您的意思，請再說一次。' }]);
+      logToSupabase('Webhook', 'Info', `Fallback reply for user ${event.source.userId}`, event.source.userId).catch(console.error);
+      return;
     }
 
     // 2. 處理圖片訊息 (請 Gemini 分析圖片)
@@ -1204,16 +1256,20 @@ ${reminderListStr}
         // 將圖片解析結果加入記憶，方便後續上下文對答
         await saveChatHistory(event.source.userId, "[使用者傳送了一張圖片]", replyText);
 
-        return await client.replyMessage(event.replyToken, messages);
+        await client.replyMessage(event.replyToken, messages);
+        logToSupabase('Webhook', 'Success', `Image processed for user ${event.source.userId}`, event.source.userId).catch(console.error);
+        return;
       } catch (err) {
         console.error('處理圖片失敗:', err);
-        return await client.replyMessage(event.replyToken, [{ type: 'text', text: '抱歉，我在「看」這張圖片時睜不開眼睛，處理發生了一點錯誤。' }]);
+        await client.replyMessage(event.replyToken, [{ type: 'text', text: '抱歉，我在「看」這張圖片時睜不開眼睛，處理發生了一點錯誤。' }]);
+        logToSupabase('Webhook', 'Error', `Image processing failed for user ${event.source.userId}`, event.source.userId, err).catch(console.error);
+        return;
       }
     }
 
     // 3. 處理語音訊息 (彈出快速回覆選單)
     if (event.type === 'message' && event.message.type === 'audio') {
-      return await client.replyMessage(event.replyToken, [{
+      await client.replyMessage(event.replyToken, [{
         type: 'text',
         text: '收到語音！請選擇您希望我幫忙處理的方式：',
         quickReply: {
@@ -1248,6 +1304,8 @@ ${reminderListStr}
           ]
         }
       }]);
+      logToSupabase('Webhook', 'Success', `Audio message received from user ${event.source.userId}, quick reply sent`, event.source.userId).catch(console.error);
+      return;
     }
 
     // 4. 處理使用者點擊快速回覆的事件 (Postback 處理器)
@@ -1286,7 +1344,9 @@ ${reminderListStr}
           const transcribedText = transcribeResponse.text?.trim() || '';
 
           if (!transcribedText) {
-            return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 無法辨識這段語音，請再試一次。' }]);
+            await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 無法辨識這段語音，請再試一次。' }]);
+            logToSupabase('Webhook', 'Error', `Voice reminder failed for user ${event.source.userId}: transcription failed`, event.source.userId).catch(console.error);
+            return;
           }
 
           // 第二步：將轉寫的文字送入意圖分析 (等同使用者打字說了這句話)
@@ -1338,7 +1398,9 @@ ${reminderListStr}
 
           if (!intentParsed || intentParsed.intent !== 'CREATE' || !intentParsed.reminders?.length) {
             await saveChatHistory(event.source.userId, `[語音提醒] ${transcribedText}`, '無法理解提醒意圖');
-            return await client.replyMessage(event.replyToken, [{ type: 'text', text: `🎙️ 我聽到您說：「${transcribedText}」\n\n😅 不太確定您想設定什麼提醒，可以再說清楚一點嗎？例如：「明天下午三點提醒我去看骨科」` }]);
+            await client.replyMessage(event.replyToken, [{ type: 'text', text: `🎙️ 我聽到您說：「${transcribedText}」\n\n😅 不太確定您想設定什麼提醒，可以再說清楚一點嗎？例如：「明天下午三點提醒我去看骨科」` }]);
+            logToSupabase('Webhook', 'Error', `Voice reminder failed for user ${event.source.userId}: intent not CREATE`, event.source.userId, { transcribedText, intentParsed }).catch(console.error);
+            return;
           }
 
           // 確保使用者存在
@@ -1353,7 +1415,9 @@ ${reminderListStr}
           }));
 
           if (remindersToInsert.length === 0) {
-            return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 無法解析提醒內容，請再試一次。' }]);
+            await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 無法解析提醒內容，請再試一次。' }]);
+            logToSupabase('Webhook', 'Error', `Voice reminder failed for user ${event.source.userId}: no valid reminders after intent parsing`, event.source.userId).catch(console.error);
+            return;
           }
 
           await saveChatHistory(event.source.userId, `[語音提醒] ${transcribedText}`, `已為您設定 ${remindersToInsert.length} 個提醒選項`);
@@ -1361,15 +1425,23 @@ ${reminderListStr}
           // 直接存入 (單筆) 或彈出選單 (多筆)
           if (remindersToInsert.length === 1) {
             const { error: insertError } = await supabase.from('reminders').insert(remindersToInsert);
-            if (insertError) return await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 儲存提醒失敗，請稍後再試。' }]);
+            if (insertError) {
+              await client.replyMessage(event.replyToken, [{ type: 'text', text: '😭 儲存提醒失敗，請稍後再試。' }]);
+              logToSupabase('Webhook', 'Error', `Voice reminder single insert failed for user ${event.source.userId}`, event.source.userId, insertError).catch(console.error);
+              return;
+            }
             const r = remindersToInsert[0];
             const localTime = new Date(r.trigger_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, dateStyle: 'short', timeStyle: 'short' });
-            return await client.replyMessage(event.replyToken, [{ type: 'text', text: `🎙️ 我聽到您說：「${transcribedText}」\n\n✅ 幫您記下來了！\n👉 [${localTime}] ${r.task}` }]);
+            await client.replyMessage(event.replyToken, [{ type: 'text', text: `🎙️ 我聽到您說：「${transcribedText}」\n\n✅ 幫您記下來了！\n👉 [${localTime}] ${r.task}` }]);
+            logToSupabase('Webhook', 'Success', `Voice reminder single insert for user ${event.source.userId}`, event.source.userId).catch(console.error);
+            return;
           }
 
           const qrMessage = await generateReminderQuickReplyMessage(event.source.userId, remindersToInsert);
           qrMessage.text = `🎙️ 我聽到您說：「${transcribedText}」\n\n${qrMessage.text}`;
-          return await client.replyMessage(event.replyToken, [qrMessage]);
+          await client.replyMessage(event.replyToken, [qrMessage]);
+          logToSupabase('Webhook', 'Success', `Voice reminder multiple options for user ${event.source.userId}`, event.source.userId).catch(console.error);
+          return;
         }
 
         // --- 潤飾 / 翻譯 路徑 ---
@@ -1410,7 +1482,9 @@ ${reminderListStr}
           
         await saveChatHistory(event.source.userId, userActionText, replyText);
 
-        return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyText }]);
+        await client.replyMessage(event.replyToken, [{ type: 'text', text: replyText }]);
+        logToSupabase('Webhook', 'Success', `Audio ${action} processed for user ${event.source.userId}`, event.source.userId).catch(console.error);
+        return;
       }
 
       // (B) 處理使用者從「多重提醒」Quick Reply 選單送出的選項
@@ -1420,7 +1494,9 @@ ${reminderListStr}
           // 清除草稿垃圾
           await supabase.from('reminders').delete().in('id', ids.split(','));
         }
-        return await client.replyMessage(event.replyToken, [{ type: 'text', text: '好的，已為您取消這次的提醒設定！' }]);
+        await client.replyMessage(event.replyToken, [{ type: 'text', text: '好的，已為您取消這次的提醒設定！' }]);
+        logToSupabase('Webhook', 'Success', `User ${event.source.userId} cancelled reminders with IDs: ${ids}`, event.source.userId).catch(console.error);
+        return;
       }
 
       if (action === 'setrmd' || action === 'setrmdall') {
@@ -1434,7 +1510,9 @@ ${reminderListStr}
         }
 
         if (idsToActivate.length === 0) {
-          return await client.replyMessage(event.replyToken, [{ type: 'text', text: '⚠️ 找不到對應的提醒選項，請重試。' }]);
+          await client.replyMessage(event.replyToken, [{ type: 'text', text: '⚠️ 找不到對應的提醒選項，請重試。' }]);
+          logToSupabase('Webhook', 'Error', `User ${event.source.userId} tried to activate reminders but no IDs found`, event.source.userId).catch(console.error);
+          return;
         }
 
         // 把草稿從資料庫撈出來並「啟動」(更新正確的時間與拔除 DRAFT 標記)
@@ -1466,7 +1544,9 @@ ${reminderListStr}
         }
 
         if (validActivations.length === 0) {
-           return await client.replyMessage(event.replyToken, [{ type: 'text', text: '⚠️ 無效的選項，可能已經過期或已被設定過。' }]);
+           await client.replyMessage(event.replyToken, [{ type: 'text', text: '⚠️ 無效的選項，可能已經過期或已被設定過。' }]);
+           logToSupabase('Webhook', 'Error', `User ${event.source.userId} tried to activate reminders but no valid drafts found`, event.source.userId).catch(console.error);
+           return;
         }
 
         // 批次更新回資料庫 activating them
@@ -1482,7 +1562,9 @@ ${reminderListStr}
         // 如果是單選，則清除其他未選擇的草稿
         // 在這裡我們採用偷懶作法，放給 2099 年自然死亡，或者可以定期清理。為了簡化不額外刪除了。
 
-        return await client.replyMessage(event.replyToken, [{ type: 'text', text: replyMsg.trim() }]);
+        await client.replyMessage(event.replyToken, [{ type: 'text', text: replyMsg.trim() }]);
+        logToSupabase('Webhook', 'Success', `User ${event.source.userId} activated ${validActivations.length} reminders`, event.source.userId).catch(console.error);
+        return;
       }
     }
 
@@ -1494,13 +1576,15 @@ ${reminderListStr}
     } else {
       console.error('Error handling event:', error.message || error);
     }
+    logToSupabase('HandleEvent', 'Error', `Error handling event for user ${event.source.userId || 'N/A'}`, event.source.userId, error).catch(console.error);
 
     if (event.replyToken) {
       try {
-        return await client.replyMessage(event.replyToken, [{
+        await client.replyMessage(event.replyToken, [{
           type: 'text',
           text: '抱歉，處理過程中發生了一點錯誤，請稍後再試。'
         }]);
+        logToSupabase('HandleEvent', 'Success', `Replied fallback error message to user ${event.source.userId}`, event.source.userId).catch(console.error);
       } catch (fallbackError) {
         console.error('Fallback error:', fallbackError.message);
       }
