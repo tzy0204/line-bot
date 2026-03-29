@@ -1137,11 +1137,12 @@ ${reminderListStr}
             }
 
             // 將函數執行結果送回給模型，讓模型產出最終的文字回覆
-            chatResponse = await chat.sendMessage({
-              message: {
-                functionResponse: { name: functionName, response: apiResponse }
+            chatResponse = await chat.sendMessage([{
+              functionResponse: {
+                name: functionName,
+                response: apiResponse
               }
-            });
+            }]);
           }
 
           const replyText = chatResponse.text || '好的，我記下來了！';
