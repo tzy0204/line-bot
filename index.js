@@ -1136,13 +1136,22 @@ ${reminderListStr}
               logToSupabase('FunctionCall', 'Error', `Function call failed: unknown function or not authorized`, event.source.userId, { functionName, args: functionArgs }).catch(console.error);
             }
 
+            // 若 Google Token 失效 (invalid_grant)，跳過 Gemini 二輪，直接告知用戶重新授權
+            if (apiResponse && apiResponse.error && apiResponse.error.includes && apiResponse.error.includes('invalid_grant') ||
+                apiResponse && apiResponse.error === '讀取記憶失敗') {
+              const reAuthUrl = `${process.env.BASE_URL || 'https://line-bot-3vci.onrender.com'}/auth?uid=${event.source.userId}`;
+              const errText = `⚠️ 您的 Google 授權已過期，我暫時無法讀取您的個人記憶檔案。\n\n請點擊下方連結重新授權 Google Drive，完成後即可恢復記憶功能：\n${reAuthUrl}`;
+              await client.replyMessage(event.replyToken, [{ type: 'text', text: errText }]);
+              logToSupabase('FunctionCall', 'Error', `OAuth token expired (invalid_grant) for user ${event.source.userId}`, event.source.userId).catch(console.error);
+              return;
+            }
+
             // 將函數執行結果送回給模型，讓模型產出最終的文字回覆
-            chatResponse = await chat.sendMessage([{
-              functionResponse: {
-                name: functionName,
-                response: apiResponse
+            chatResponse = await chat.sendMessage({
+              message: {
+                functionResponse: { name: functionName, response: apiResponse }
               }
-            }]);
+            });
           }
 
           const replyText = chatResponse.text || '好的，我記下來了！';
