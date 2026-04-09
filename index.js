@@ -610,7 +610,9 @@ function generateForumFlexMessage(posts) {
             action: {
               type: 'uri',
               label: '閱讀全文',
-              uri: post.url || 'https://www.google.com'
+              uri: (post.url || 'https://www.google.com').includes('?') 
+                ? `${post.url || 'https://www.google.com'}&openExternalBrowser=1` 
+                : `${post.url || 'https://www.google.com'}?openExternalBrowser=1`
             }
           }
         ]
