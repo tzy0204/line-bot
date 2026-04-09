@@ -548,7 +548,6 @@ function generateForumFlexMessage(posts) {
 
     return {
       type: 'bubble',
-      size: 'medium',
       header: {
         type: 'box',
         layout: 'vertical',
