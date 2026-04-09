@@ -530,6 +530,105 @@ const memoryFunctions = {
   }
 };
 
+/**
+ * 將多筆論壇貼文轉換成 LINE Flex Carousel 訊息
+ * @param {Array} posts - 從 Supabase 取回的貼文陣列
+ */
+function generateForumFlexMessage(posts) {
+  const bubbles = posts.map((post) => {
+    // 限制內容長度
+    const contentSnippet = post.content && post.content.length > 80 
+      ? post.content.substring(0, 80) + '...' 
+      : (post.content || '目前無內容摘要');
+    
+    // 根據熱度產生火的圖案 (engagement_score)
+    // 假設 engagement_score 較高代表較熱門
+    const hotLevel = Math.min(Math.floor((post.engagement_score || 0) / 10), 5); 
+    const fireIcons = '🔥'.repeat(Math.max(1, hotLevel));
+
+    return {
+      type: 'bubble',
+      size: 'medium',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#0367D3',
+        contents: [
+          {
+            type: 'text',
+            text: `[${post.source || '論壇'}] ${post.category || '分類'}`,
+            color: '#ffffff',
+            weight: 'bold',
+            size: 'sm'
+          }
+        ]
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          {
+            type: 'text',
+            text: post.title || '無標題',
+            weight: 'bold',
+            size: 'md',
+            wrap: true,
+            margin: 'md'
+          },
+          {
+            type: 'text',
+            text: contentSnippet,
+            size: 'xs',
+            color: '#666666',
+            wrap: true,
+            margin: 'md'
+          },
+          {
+            type: 'box',
+            layout: 'horizontal',
+            margin: 'lg',
+            contents: [
+              {
+                type: 'text',
+                text: `熱度 ${fireIcons}`,
+                size: 'xs',
+                color: '#999999',
+                flex: 0
+              }
+            ]
+          }
+        ]
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        contents: [
+          {
+            type: 'button',
+            style: 'primary',
+            height: 'sm',
+            color: '#0367D3',
+            action: {
+              type: 'uri',
+              label: '閱讀全文',
+              uri: post.url || 'https://www.google.com'
+            }
+          }
+        ]
+      }
+    };
+  });
+
+  return {
+    type: 'flex',
+    altText: '今日熱門論壇摘要',
+    contents: {
+      type: 'carousel',
+      contents: bubbles.slice(0, 10)
+    }
+  };
+}
+
 // register a webhook handler with middleware
 // about the middleware, please refer to doc
 app.post('/webhook', line.middleware(config), (req, res) => {
@@ -633,6 +732,33 @@ async function handleEvent(event) {
           return await client.replyMessage(event.replyToken, [{ type: 'text', text: newsContent }]);
         } else {
           const notReadyMsg = '☕ 今日晨報還在準備中，請稍後再試！\n（晨報通常於每天早上 06:30 整理完畢）';
+          return await client.replyMessage(event.replyToken, [{ type: 'text', text: notReadyMsg }]);
+        }
+      }
+
+      // --- 💬 每日論壇 — 從 Supabase 拉取當日論壇熱門貼文 ---
+      if (userText.includes('每日論壇') || userText.includes('論壇熱門') || userText.includes('熱門論壇')) {
+        const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Taipei' }); // 'YYYY-MM-DD'
+        
+        const { data: forumPosts, error: forumErr } = await supabase
+          .from('forum_posts')
+          .select('*')
+          .eq('date', today)
+          .order('engagement_score', { ascending: false })
+          .limit(10);
+
+        if (forumErr) {
+          console.error('Error fetching forum posts:', forumErr);
+          return await client.replyMessage(event.replyToken, [{ type: 'text', text: '❌ 讀取論壇資料發生錯誤，請稍後再試。' }]);
+        }
+
+        if (forumPosts && forumPosts.length > 0) {
+          const flexMsg = generateForumFlexMessage(forumPosts);
+          // 由於 Flex Message 不好直接存入對話歷史（字數太多），這裡只紀錄觸發動作
+          await saveChatHistory(event.source.userId, userText, `[發送了 ${forumPosts.length} 則論壇熱門貼文卡片]`);
+          return await client.replyMessage(event.replyToken, [flexMsg]);
+        } else {
+          const notReadyMsg = '☕ 今日論壇摘要還在整理中，請稍後再試！';
           return await client.replyMessage(event.replyToken, [{ type: 'text', text: notReadyMsg }]);
         }
       }
