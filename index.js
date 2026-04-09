@@ -546,6 +546,16 @@ function generateForumFlexMessage(posts) {
     const hotLevel = Math.min(Math.floor((post.engagement_score || 0) / 10), 5); 
     const fireIcons = '🔥'.repeat(Math.max(1, hotLevel));
 
+    let targetUrl = (post.url || 'https://www.google.com').trim();
+    
+    // 將 x.com 轉回 twitter.com 以提高 App 深層連結的相容性
+    if (targetUrl.includes('x.com')) {
+      targetUrl = targetUrl.replace('x.com', 'twitter.com');
+    }
+
+    const separator = targetUrl.includes('?') ? '&' : '?';
+    const finalUrl = `${targetUrl}${separator}openExternalBrowser=1`;
+
     return {
       type: 'bubble',
       header: {
@@ -610,9 +620,7 @@ function generateForumFlexMessage(posts) {
             action: {
               type: 'uri',
               label: '閱讀全文',
-              uri: (post.url || 'https://www.google.com').includes('?') 
-                ? `${post.url || 'https://www.google.com'}&openExternalBrowser=1` 
-                : `${post.url || 'https://www.google.com'}?openExternalBrowser=1`
+              uri: finalUrl
             }
           }
         ]
@@ -754,6 +762,9 @@ async function handleEvent(event) {
         }
 
         if (forumPosts && forumPosts.length > 0) {
+          // 在後台列印第一筆網址以便偵錯
+          console.log(`[Forum Debug] First Post URL: ${forumPosts[0].url}`);
+          
           const flexMsg = generateForumFlexMessage(forumPosts);
           // 由於 Flex Message 不好直接存入對話歷史（字數太多），這裡只紀錄觸發動作
           await saveChatHistory(event.source.userId, userText, `[發送了 ${forumPosts.length} 則論壇熱門貼文卡片]`);
