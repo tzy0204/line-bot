@@ -1458,7 +1458,54 @@ ${reminderListStr}
       }
     }
 
-    // 3. 處理語音訊息 (彈出快速回覆選單)
+    // 3. 處理影片訊息 (請 Gemini 分析影片)
+    if (event.type === 'message' && event.message.type === 'video') {
+      try {
+        // 從 LINE 伺服器下載影片檔案
+        const stream = await client.getMessageContent(event.message.id);
+        const chunks = [];
+        for await (const chunk of stream) {
+          chunks.push(chunk);
+        }
+        const videoBuffer = Buffer.concat(chunks);
+        const base64Video = videoBuffer.toString('base64');
+
+        // 準備送給 Gemini 的 Prompt
+        const prompt = `請用繁體中文描述這段影片的主要內容。如果有重要的細節也請稍微總結一下。`;
+
+        const { data: userSetting } = await supabase
+          .from('users')
+          .select('selected_model')
+          .eq('line_user_id', targetId)
+          .single();
+        const targetModel = userSetting?.selected_model || 'gemini-3-flash-preview';
+
+        const response = await ai.models.generateContent({
+          model: targetModel,
+          contents: [
+            prompt,
+            {
+              inlineData: {
+                data: base64Video,
+                mimeType: 'video/mp4'
+              }
+            }
+          ]
+        });
+
+        await saveChatHistory(targetId, "[使用者傳送了一段影片]", response.text);
+        await client.replyMessage(event.replyToken, [{ type: 'text', text: response.text }]);
+        logToSupabase('Webhook', 'Success', `Video processed for user ${targetId}`, targetId).catch(console.error);
+        return;
+      } catch (err) {
+        console.error('處理影片失敗:', err);
+        await client.replyMessage(event.replyToken, [{ type: 'text', text: '收到影片了！不過檔案可能太大或者目前暫時無法分析，我會繼續學習的 🎬' }]);
+        logToSupabase('Webhook', 'Error', `Video processing failed for user ${targetId}`, targetId, err).catch(console.error);
+        return;
+      }
+    }
+
+    // 4. 處理語音訊息 (彈出快速回覆選單)
     if (event.type === 'message' && event.message.type === 'audio') {
       await client.replyMessage(event.replyToken, [{
         type: 'text',
