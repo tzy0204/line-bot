@@ -739,7 +739,7 @@ async function handleEvent(event) {
             console.log(`Downloading FB video from ${fbUrl}`);
             await youtubedl(fbUrl, {
               output: tempFilePath,
-              format: 'best[filesize<50M]',
+              format: 'best',
               noCheckCertificates: true,
               noWarnings: true
             });
