@@ -751,8 +751,28 @@ async function handleEvent(event) {
               mimeType: 'video/mp4',
             });
 
-            // 等待檔案在後台處理完成
-            await new Promise(resolve => setTimeout(resolve, 5000));
+            // 確保取得正確的檔案資訊 (相容不同版本的結構)
+            const fileName = uploadResponse.file ? uploadResponse.file.name : uploadResponse.name;
+            const fileUri = uploadResponse.file ? uploadResponse.file.uri : uploadResponse.uri;
+            const fileMimeType = uploadResponse.file ? uploadResponse.file.mimeType : (uploadResponse.mimeType || 'video/mp4');
+
+            // 等待影片在後台處理完成 (ACTIVE 狀態)
+            let fileState = uploadResponse.file ? uploadResponse.file.state : uploadResponse.state;
+            let retries = 0;
+            while (fileState === 'PROCESSING' && retries < 12) {
+              console.log(`FB Video processing in Gemini... (${retries + 1}/12)`);
+              await new Promise(resolve => setTimeout(resolve, 5000));
+              const getFileResponse = await ai.files.get({ name: fileName });
+              fileState = getFileResponse.file ? getFileResponse.file.state : getFileResponse.state;
+              retries++;
+            }
+
+            if (fileState === 'FAILED') {
+              throw new Error('Gemini 處理影片檔案失敗');
+            }
+            if (fileState === 'PROCESSING') {
+              throw new Error('Gemini 處理影片超時');
+            }
 
             const prompt = `請用繁體中文詳細摘要這段影片的內容與核心重點。`;
             
@@ -762,10 +782,6 @@ async function handleEvent(event) {
               .eq('line_user_id', targetId)
               .single();
             const targetModel = userSetting?.selected_model || 'gemini-3-flash-preview';
-
-            // GoogleGenAI 的 File API 回傳結構可能是 uploadResponse.file.uri 或直接 uploadResponse.uri
-            const fileUri = uploadResponse.file ? uploadResponse.file.uri : uploadResponse.uri;
-            const fileMimeType = uploadResponse.file ? uploadResponse.file.mimeType : (uploadResponse.mimeType || 'video/mp4');
 
             const aiResponse = await ai.models.generateContent({
               model: targetModel,
@@ -781,7 +797,7 @@ async function handleEvent(event) {
             
           } catch (err) {
             console.error('FB Video Processing Error:', err);
-            await client.pushMessage(targetId, [{ type: 'text', text: '❌ 無法取得或解析該 Facebook 影片。這可能是因為影片設有隱私限制，或是檔案過大/格式不支援。' }]);
+            await client.pushMessage(targetId, [{ type: 'text', text: `❌ 處理 Facebook 影片時發生錯誤：\n${err.message}\n\n這可能是因為影片設有隱私限制，或是檔案格式不受支援。` }]);
           } finally {
             if (fs.existsSync(tempFilePath)) {
               fs.unlinkSync(tempFilePath);
