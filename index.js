@@ -3,6 +3,10 @@ const line = require('@line/bot-sdk');
 const { google } = require('googleapis');
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
+const youtubedl = require('youtube-dl-exec');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 // Initialize Supabase client
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -716,6 +720,77 @@ async function handleEvent(event) {
     // 1. 處理一般文字訊息 (一般 AI 聊天或設定/查詢/取消提醒)
     if (event.type === 'message' && event.message.type === 'text') {
       const userText = event.message.text.trim();
+
+      // --- FB 影片連結偵測與處理 ---
+      const fbRegex = /(https?:\/\/(?:www\.)?(?:facebook\.com|fb\.watch|fb\.gg)\/[^\s]+)/i;
+      const fbMatch = userText.match(fbRegex);
+
+      if (fbMatch) {
+        const fbUrl = fbMatch[1];
+        
+        // 先回覆使用者正在處理中
+        await client.replyMessage(event.replyToken, [{ type: 'text', text: '🔄 正在擷取 Facebook 影片並生成摘要，這可能需要幾十秒鐘，請稍候...' }]);
+        
+        // 放至背景非同步執行
+        (async () => {
+          const tempFilePath = path.join(os.tmpdir(), `fb_video_${Date.now()}.mp4`);
+          
+          try {
+            console.log(`Downloading FB video from ${fbUrl}`);
+            await youtubedl(fbUrl, {
+              output: tempFilePath,
+              format: 'best[filesize<50M]',
+              noCheckCertificates: true,
+              noWarnings: true
+            });
+
+            console.log('Uploading FB video to Gemini...');
+            // Upload using Gen AI File API
+            const uploadResponse = await ai.files.upload({
+              file: tempFilePath,
+              mimeType: 'video/mp4',
+            });
+
+            // 等待檔案在後台處理完成
+            await new Promise(resolve => setTimeout(resolve, 5000));
+
+            const prompt = `請用繁體中文詳細摘要這段影片的內容與核心重點。`;
+            
+            const { data: userSetting } = await supabase
+              .from('users')
+              .select('selected_model')
+              .eq('line_user_id', targetId)
+              .single();
+            const targetModel = userSetting?.selected_model || 'gemini-3-flash-preview';
+
+            // GoogleGenAI 的 File API 回傳結構可能是 uploadResponse.file.uri 或直接 uploadResponse.uri
+            const fileUri = uploadResponse.file ? uploadResponse.file.uri : uploadResponse.uri;
+            const fileMimeType = uploadResponse.file ? uploadResponse.file.mimeType : (uploadResponse.mimeType || 'video/mp4');
+
+            const aiResponse = await ai.models.generateContent({
+              model: targetModel,
+              contents: [
+                { fileData: { fileUri: fileUri, mimeType: fileMimeType } },
+                { text: prompt }
+              ]
+            });
+
+            const replyText = aiResponse.text || '無法生成摘要';
+            await client.pushMessage(targetId, [{ type: 'text', text: `🎬 【Facebook 影片摘要】\n\n${replyText}` }]);
+            await saveChatHistory(targetId, userText, `[已為使用者摘要 FB 影片] ${replyText}`);
+            
+          } catch (err) {
+            console.error('FB Video Processing Error:', err);
+            await client.pushMessage(targetId, [{ type: 'text', text: '❌ 無法取得或解析該 Facebook 影片。這可能是因為影片設有隱私限制，或是檔案過大/格式不支援。' }]);
+          } finally {
+            if (fs.existsSync(tempFilePath)) {
+              fs.unlinkSync(tempFilePath);
+            }
+          }
+        })();
+        
+        return;
+      }
 
       // --- 🗞️ 今日晨報 — 從 Supabase 拉取 my_agent 採集的每日晨報 ---
       // 使用者輸入「晨報」或「今日新聞」時，直接回覆，不經過 AI 意圖判斷，節省 Token
