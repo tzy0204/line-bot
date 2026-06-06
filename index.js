@@ -774,7 +774,13 @@ async function handleEvent(event) {
               throw new Error('Gemini 處理影片超時');
             }
 
-            const prompt = `請用繁體中文詳細摘要這段影片的內容與核心重點。`;
+            const prompt = `您是一位專業的內容查核與事實分析專家。
+請針對這段影片進行詳細的分析，並完成以下任務：
+1. 【影片摘要】：首先，簡單扼要地總結影片的內容與核心重點。
+2. 【關鍵字與主張擷取】：抓取影片中所宣稱的重要資訊、數據或關鍵字。
+3. 【事實查核與多方比對】：請透過網路搜尋，將影片中的宣稱與多方權威來源（如權威研究機構、官方數據或專家佐證）進行綜合比對，不要只依賴單一數據來源。
+4. 【結論與判定】：最後，透過有條理的方式提供您統整後的判定。請明確指出這段影片的內容「哪些是真實的」、「哪些是待商榷或需要再考證的部分」，以及「整體是否可能為網路謠言或假消息」。
+請用繁體中文回覆，語氣客觀且具邏輯性。`;
             
             const { data: userSetting } = await supabase
               .from('users')
@@ -788,7 +794,10 @@ async function handleEvent(event) {
               contents: [
                 { fileData: { fileUri: fileUri, mimeType: fileMimeType } },
                 { text: prompt }
-              ]
+              ],
+              config: {
+                tools: [{ googleSearch: {} }]
+              }
             });
 
             const replyText = aiResponse.text || '無法生成摘要';
