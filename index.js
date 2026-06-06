@@ -722,7 +722,7 @@ async function handleEvent(event) {
       const userText = event.message.text.trim();
 
       // --- FB 影片連結偵測與處理 ---
-      const fbRegex = /(https?:\/\/(?:www\.)?(?:facebook\.com|fb\.watch|fb\.gg)\/[^\s]+)/i;
+      const fbRegex = /(https?:\/\/(?:[a-zA-Z0-9-]+\.)*(?:facebook\.com|fb\.watch|fb\.gg)\/[a-zA-Z0-9\-._~:\/?#\[\]@!$&'()*+,;=%]+)/i;
       const fbMatch = userText.match(fbRegex);
 
       if (fbMatch) {
