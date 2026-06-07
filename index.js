@@ -721,30 +721,55 @@ async function handleEvent(event) {
     if (event.type === 'message' && event.message.type === 'text') {
       const userText = event.message.text.trim();
 
-      // --- FB 影片連結偵測與處理 ---
-      const fbRegex = /(https?:\/\/(?:[a-zA-Z0-9-]+\.)*(?:facebook\.com|fb\.watch|fb\.gg)\/[a-zA-Z0-9\-._~:\/?#\[\]@!$&'()*+,;=%]+)/i;
-      const fbMatch = userText.match(fbRegex);
+      // --- 社群影片連結偵測與處理 (Facebook, Threads, IG, TikTok 等) ---
+      const videoRegex = /(https?:\/\/(?:[a-zA-Z0-9-]+\.)*(?:facebook\.com|fb\.watch|fb\.gg|threads\.net|threads\.com|instagram\.com|tiktok\.com|youtube\.com|youtu\.be|x\.com|twitter\.com)\/[a-zA-Z0-9\-._~:\/?#\[\]@!$&'()*+,;=%]+)/i;
+      const videoMatch = userText.match(videoRegex);
 
-      if (fbMatch) {
-        const fbUrl = fbMatch[1];
+      if (videoMatch) {
+        const videoUrl = videoMatch[1];
         
         // 先回覆使用者正在處理中
-        await client.replyMessage(event.replyToken, [{ type: 'text', text: '🔄 正在擷取 Facebook 影片並生成摘要，這可能需要幾十秒鐘，請稍候...' }]);
+        await client.replyMessage(event.replyToken, [{ type: 'text', text: '🔄 正在擷取影片並生成摘要，這可能需要幾十秒鐘，請稍候...' }]);
         
         // 放至背景非同步執行
         (async () => {
-          const tempFilePath = path.join(os.tmpdir(), `fb_video_${Date.now()}.mp4`);
+          const tempFilePath = path.join(os.tmpdir(), `social_video_${Date.now()}.mp4`);
           
           try {
-            console.log(`Downloading FB video from ${fbUrl}`);
-            await youtubedl(fbUrl, {
-              output: tempFilePath,
-              format: 'best',
-              noCheckCertificates: true,
-              noWarnings: true
-            });
+            console.log(`Downloading video from ${videoUrl}`);
+            let downloadSuccess = false;
 
-            console.log('Uploading FB video to Gemini...');
+            // 如果是 Threads，使用 btch-downloader 因為 yt-dlp 預設尚未完美支援
+            if (videoUrl.includes('threads.net') || videoUrl.includes('threads.com')) {
+              console.log('Using btch-downloader for Threads');
+              const btch = require('btch-downloader');
+              const res = await btch.threads(videoUrl);
+              const directUrl = res?.result?.video;
+              
+              if (directUrl) {
+                const response = await fetch(directUrl);
+                if (!response.ok) throw new Error(`Unexpected response ${response.statusText}`);
+                const { Readable } = require('stream');
+                const { finished } = require('stream/promises');
+                const fileStream = require('fs').createWriteStream(tempFilePath, { flags: 'wx' });
+                await finished(Readable.fromWeb(response.body).pipe(fileStream));
+                downloadSuccess = true;
+              } else {
+                console.log('btch-downloader returned no video URL, falling back to youtubedl...');
+              }
+            }
+
+            // 預設使用 youtube-dl-exec (支援 Facebook, IG, TikTok, YouTube 等大部分平台)
+            if (!downloadSuccess) {
+              await youtubedl(videoUrl, {
+                output: tempFilePath,
+                format: 'best',
+                noCheckCertificates: true,
+                noWarnings: true
+              });
+            }
+
+            console.log('Uploading video to Gemini...');
             // Upload using Gen AI File API
             const uploadResponse = await ai.files.upload({
               file: tempFilePath,
@@ -760,7 +785,7 @@ async function handleEvent(event) {
             let fileState = uploadResponse.file ? uploadResponse.file.state : uploadResponse.state;
             let retries = 0;
             while (fileState === 'PROCESSING' && retries < 12) {
-              console.log(`FB Video processing in Gemini... (${retries + 1}/12)`);
+              console.log(`Video processing in Gemini... (${retries + 1}/12)`);
               await new Promise(resolve => setTimeout(resolve, 5000));
               const getFileResponse = await ai.files.get({ name: fileName });
               fileState = getFileResponse.file ? getFileResponse.file.state : getFileResponse.state;
@@ -801,12 +826,12 @@ async function handleEvent(event) {
             });
 
             const replyText = aiResponse.text || '無法生成摘要';
-            await client.pushMessage(targetId, [{ type: 'text', text: `🎬 【Facebook 影片摘要】\n\n${replyText}` }]);
-            await saveChatHistory(targetId, userText, `[已為使用者摘要 FB 影片] ${replyText}`);
+            await client.pushMessage(targetId, [{ type: 'text', text: `🎬 【影片摘要】\n\n${replyText}` }]);
+            await saveChatHistory(targetId, userText, `[已為使用者摘要影片] ${replyText}`);
             
           } catch (err) {
-            console.error('FB Video Processing Error:', err);
-            await client.pushMessage(targetId, [{ type: 'text', text: `❌ 處理 Facebook 影片時發生錯誤：\n${err.message}\n\n這可能是因為影片設有隱私限制，或是檔案格式不受支援。` }]);
+            console.error('Video Processing Error:', err);
+            await client.pushMessage(targetId, [{ type: 'text', text: `❌ 處理影片時發生錯誤：\n${err.message}\n\n這可能是因為影片設有隱私限制，或是檔案格式不受支援。` }]);
           } finally {
             if (fs.existsSync(tempFilePath)) {
               fs.unlinkSync(tempFilePath);
