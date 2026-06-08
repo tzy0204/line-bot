@@ -739,12 +739,19 @@ async function handleEvent(event) {
             console.log(`Downloading video from ${videoUrl}`);
             let downloadSuccess = false;
 
-            // 如果是 Threads，使用 btch-downloader 因為 yt-dlp 預設尚未完美支援
-            if (videoUrl.includes('threads.net') || videoUrl.includes('threads.com')) {
-              console.log('Using btch-downloader for Threads');
+            // 針對 YouTube 與 Threads 使用 btch-downloader 以避開 yt-dlp 的驗證問題或不支援
+            if (videoUrl.includes('threads.net') || videoUrl.includes('threads.com') || videoUrl.includes('youtube.com') || videoUrl.includes('youtu.be')) {
+              console.log('Using btch-downloader for Threads / YouTube');
               const btch = require('btch-downloader');
-              const res = await btch.threads(videoUrl);
-              const directUrl = res?.result?.video;
+              let directUrl = null;
+
+              if (videoUrl.includes('threads')) {
+                const res = await btch.threads(videoUrl);
+                directUrl = res?.result?.video;
+              } else {
+                const res = await btch.youtube(videoUrl);
+                directUrl = res?.mp4;
+              }
               
               if (directUrl) {
                 const response = await fetch(directUrl);
