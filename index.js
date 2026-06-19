@@ -744,12 +744,18 @@ async function handleEvent(event) {
               console.log('Using btch-downloader for Threads / YouTube');
               const btch = require('btch-downloader');
               let directUrl = null;
+              let normalizedVideoUrl = videoUrl;
 
-              if (videoUrl.includes('threads')) {
-                const res = await btch.threads(videoUrl);
+              // btch-downloader 不支援 m.youtube.com 格式，需要轉換為 www.youtube.com
+              if (normalizedVideoUrl.includes('m.youtube.com')) {
+                normalizedVideoUrl = normalizedVideoUrl.replace('m.youtube.com', 'www.youtube.com');
+              }
+
+              if (normalizedVideoUrl.includes('threads')) {
+                const res = await btch.threads(normalizedVideoUrl);
                 directUrl = res?.result?.video;
               } else {
-                const res = await btch.youtube(videoUrl);
+                const res = await btch.youtube(normalizedVideoUrl);
                 directUrl = res?.mp4;
               }
               
