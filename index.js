@@ -29,7 +29,7 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
   global: {
     fetch: (url, options = {}) => {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 秒逾時
+      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 秒逾時（Supabase Free tier 冷啟動可能需要 20~25 秒）
       return fetch(url, { ...options, signal: controller.signal })
         .finally(() => clearTimeout(timeoutId));
     }
