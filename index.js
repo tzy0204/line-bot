@@ -54,6 +54,17 @@ async function logToSupabase(taskType, status, message) {
   }
 }
 
+// 全域異常與 Promise 拒絕處理，避免 Node.js 進程崩潰
+process.on('uncaughtException', (err) => {
+  console.error('🔥 [Fatal] Uncaught Exception:', err);
+  logToSupabase('System', 'FatalError', `Uncaught Exception: ${err.message || err}`).catch(console.error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('🔥 [Fatal] Unhandled Rejection at:', promise, 'reason:', reason);
+  logToSupabase('System', 'FatalError', `Unhandled Rejection: ${reason?.message || reason}`).catch(console.error);
+});
+
 // 將對話上下文存入 Supabase (維持最新 10 次對答，即 20 筆訊息)
 async function saveChatHistory(userId, userText, modelText) {
 
@@ -660,57 +671,74 @@ async function handleEvent(event) {
   // 非同步紀錄收到事件
   logToSupabase('Webhook', 'Info', `Received event: ${event.type}`).catch(console.error);
 
-  // --- Track Message Usage ---
-  if (event.type === 'message') {
+  // 預先載入使用者的完整資料，整併後續所有邏輯的 DB 查詢
+  let userRecord = null;
+  if (targetId && (event.type === 'message' || event.type === 'postback')) {
     try {
-      // Increment message_count for the user smoothly
-      const { data: userRecord, error: selectErr } = await supabase
+      const { data, error } = await supabase
         .from('users')
-        .select('message_count')
+        .select('message_count, chat_history, selected_model, google_refresh_token, is_auth_completed')
         .eq('line_user_id', targetId)
         .single();
-
-      if (selectErr && selectErr.code !== 'PGRST116') {
-        console.error('Error fetching user for message_count:', selectErr);
+      if (!error && data) {
+        userRecord = data;
       }
+    } catch (dbErr) {
+      console.error('Failed to pre-fetch user record from Supabase:', dbErr);
+    }
+  }
+
+  // --- Track Message Usage (優化版：背景異步更新，免去 await 阻塞) ---
+  if (event.type === 'message') {
+    try {
+      const currentCount = userRecord ? (userRecord.message_count || 0) : 0;
+      const newCount = currentCount + 1;
 
       if (userRecord) {
-        // User exists, update count
-        const newCount = (userRecord.message_count || 0) + 1;
-        const { error: updateErr } = await supabase
+        userRecord.message_count = newCount;
+        supabase
           .from('users')
           .update({ message_count: newCount })
-          .eq('line_user_id', targetId);
-        if (updateErr) console.error('Failed to update message count:', updateErr);
+          .eq('line_user_id', targetId)
+          .then(({ error }) => {
+            if (error) console.error('Failed to update message count:', error);
+          });
       } else {
-        // User does not exist, insert new
-        const { error: insertErr } = await supabase
+        supabase
           .from('users')
-          .insert([{ line_user_id: targetId, message_count: 1 }]);
-        if (insertErr) console.error('Failed to insert new user message count:', insertErr);
+          .insert([{ line_user_id: targetId, message_count: 1 }])
+          .then(({ error }) => {
+            if (error) console.error('Failed to insert new user message count:', error);
+          });
       }
     } catch (err) {
       console.error('Failed to update message count tracking:', err);
     }
   }
 
-  // --- Helper: Save Chat History ---
-  async function saveChatHistory(userId, userText, modelReplyText) {
+  // --- Helper: Save Chat History (優化版：使用 cache 且背景異步寫入) ---
+  function saveChatHistory(userId, userText, modelReplyText) {
     try {
-      const { data: user } = await supabase
-        .from('users')
-        .select('chat_history')
-        .eq('line_user_id', userId)
-        .single();
-        
-      const history = Array.isArray(user?.chat_history) ? user.chat_history : [];
+      const history = (userRecord && Array.isArray(userRecord.chat_history)) 
+        ? userRecord.chat_history 
+        : [];
       const newHistory = [
         ...history,
         { role: 'user', text: userText },
         { role: 'model', text: modelReplyText }
       ].slice(-20); // Keep last 20 messages (10 interactions)
       
-      await supabase.from('users').update({ chat_history: newHistory }).eq('line_user_id', userId);
+      if (userRecord) {
+        userRecord.chat_history = newHistory;
+      }
+      
+      supabase
+        .from('users')
+        .update({ chat_history: newHistory })
+        .eq('line_user_id', userId)
+        .then(({ error }) => {
+          if (error) console.error('Failed to async save chat history:', error);
+        });
     } catch (e) {
       console.error('Failed to save chat history:', e);
     }
@@ -762,10 +790,31 @@ async function handleEvent(event) {
               if (directUrl) {
                 const response = await fetch(directUrl);
                 if (!response.ok) throw new Error(`Unexpected response ${response.statusText}`);
+                
+                // 檢查 Content-Length 限制 (15MB)
+                const contentLength = response.headers.get('content-length');
+                if (contentLength && parseInt(contentLength, 10) > 15 * 1024 * 1024) {
+                  throw new Error('影片檔案過大，請勿傳送大於 15MB 的影片以避免系統過載。');
+                }
+
                 const { Readable } = require('stream');
                 const { finished } = require('stream/promises');
                 const fileStream = require('fs').createWriteStream(tempFilePath, { flags: 'wx' });
-                await finished(Readable.fromWeb(response.body).pipe(fileStream));
+                
+                // 限制串流寫入大小，避免 header 缺失時下載超大檔案
+                let downloadedBytes = 0;
+                const limitStream = new (require('stream').Transform)({
+                  transform(chunk, encoding, callback) {
+                    downloadedBytes += chunk.length;
+                    if (downloadedBytes > 15 * 1024 * 1024) {
+                      callback(new Error('影片檔案過大，請勿傳送大於 15MB 的影片以避免系統過載。'));
+                    } else {
+                      callback(null, chunk);
+                    }
+                  }
+                });
+
+                await finished(Readable.fromWeb(response.body).pipe(limitStream).pipe(fileStream));
                 downloadSuccess = true;
               } else {
                 console.log('btch-downloader returned no video URL, falling back to youtubedl...');
@@ -776,7 +825,8 @@ async function handleEvent(event) {
             if (!downloadSuccess) {
               await youtubedl(videoUrl, {
                 output: tempFilePath,
-                format: 'best',
+                format: 'worst[ext=mp4]/best[height<=360]', // 限制解析度以降低 CPU/記憶體/頻寬負載
+                maxFilesize: '15m', // 限制最大 15MB 避免 OOM 崩潰
                 noCheckCertificates: true,
                 noWarnings: true
               });
@@ -820,12 +870,7 @@ async function handleEvent(event) {
 4. 【結論與判定】：最後，透過有條理的方式提供您統整後的判定。請明確指出這段影片的內容「哪些是真實的」、「哪些是待商榷或需要再考證的部分」，以及「整體是否可能為網路謠言或假消息」。
 請用繁體中文回覆，語氣客觀且具邏輯性。`;
             
-            const { data: userSetting } = await supabase
-              .from('users')
-              .select('selected_model')
-              .eq('line_user_id', targetId)
-              .single();
-            const targetModel = userSetting?.selected_model || 'gemini-3-flash-preview';
+            const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
 
             const aiResponse = await ai.models.generateContent({
               model: targetModel,
@@ -1115,17 +1160,12 @@ async function handleEvent(event) {
       // 使用 Asia/Taipei 時區的字串，讓 Gemini 知道現在的台灣時間
       const nowStr = now.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
 
-      // 取出使用者的歷史紀錄，作為判斷意圖的文本上下文
-      const { data: userContext } = await supabase
-        .from('users')
-        .select('chat_history')
-        .eq('line_user_id', targetId)
-        .single();
-      
+      // 取出使用者的歷史紀錄，作為判斷意圖的文本上下文 (優化版：使用記憶體資料)
       let contextStr = '';
-      if (userContext && Array.isArray(userContext.chat_history) && userContext.chat_history.length > 0) {
+      const chatHistory = userRecord?.chat_history;
+      if (chatHistory && Array.isArray(chatHistory) && chatHistory.length > 0) {
         // 只拿最後 4 句話作為短期語境 (避免 Token 過度消耗)
-        const recentHistory = userContext.chat_history.slice(-4);
+        const recentHistory = chatHistory.slice(-4);
         contextStr = '【近期對話上下文】\n' + recentHistory.map(h => `${h.role === 'user' ? '使用者' : 'AI'}: ${h.text}`).join('\n') + '\n\n';
       }
 
@@ -1178,14 +1218,8 @@ async function handleEvent(event) {
 
 請務必只回傳合法的 JSON 字串，不要有其他任何前後文、Markdown 語法或解釋。`;
 
-      // 查詢用戶設定，決定要使用的模型 (如果沒設定，一般文字意圖預設使用最省資源的 lite-preview)
-      const { data: userSetting } = await supabase
-        .from('users')
-        .select('selected_model')
-        .eq('line_user_id', targetId)
-        .single();
-
-      const targetModel = userSetting?.selected_model || 'gemini-3.1-flash-lite-preview';
+      // 決定要使用的模型 (如果沒設定，一般文字意圖預設使用最省資源的 lite-preview) (優化版：使用記憶體資料)
+      const targetModel = userRecord?.selected_model || 'gemini-3.1-flash-lite-preview';
 
       const response = await ai.models.generateContent({
         model: targetModel,
@@ -1366,12 +1400,8 @@ ${reminderListStr}
         else if (parsedData.intent === 'CHAT') {
           // 一般聊天回覆與個人記憶庫功能 (Function Calling)
 
-          // 確認授權狀態與短期記憶
-          const { data: user } = await supabase
-            .from('users')
-            .select('google_refresh_token, is_auth_completed, chat_history')
-            .eq('line_user_id', targetId)
-            .single();
+          // 確認授權狀態與短期記憶 (優化版：使用預先載入的記憶體資料)
+          const user = userRecord;
 
           let systemInstruction = '';
           let tools = undefined;
@@ -1525,13 +1555,8 @@ ${reminderListStr}
   ]
 }`;
 
-        // 查詢用戶設定的偏好模型 (圖片分析偏向複雜理解，預設使用 3-flash-preview)
-        const { data: userSetting } = await supabase
-          .from('users')
-          .select('selected_model')
-          .eq('line_user_id', targetId)
-          .single();
-        const targetModel = userSetting?.selected_model || 'gemini-3-flash-preview';
+        // 查詢用戶設定的偏好模型 (圖片分析偏向複雜理解，預設使用 3-flash-preview) (優化版：使用記憶體資料)
+        const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
 
         // 傳送給 Gemini 處理
         const response = await ai.models.generateContent({
@@ -1599,10 +1624,15 @@ ${reminderListStr}
     // 3. 處理影片訊息 (請 Gemini 分析影片)
     if (event.type === 'message' && event.message.type === 'video') {
       try {
-        // 從 LINE 伺服器下載影片檔案
+        // 從 LINE 伺服器下載影片檔案 (加上 15MB 限制防範記憶體溢出)
         const stream = await client.getMessageContent(event.message.id);
         const chunks = [];
+        let totalLength = 0;
         for await (const chunk of stream) {
+          totalLength += chunk.length;
+          if (totalLength > 15 * 1024 * 1024) { // 15MB 限制
+            throw new Error('影片檔案過大，請發送小於 15MB 的影片以避免系統過載。');
+          }
           chunks.push(chunk);
         }
         const videoBuffer = Buffer.concat(chunks);
@@ -1611,12 +1641,7 @@ ${reminderListStr}
         // 準備送給 Gemini 的 Prompt
         const prompt = `請用繁體中文描述這段影片的主要內容。如果有重要的細節也請稍微總結一下。`;
 
-        const { data: userSetting } = await supabase
-          .from('users')
-          .select('selected_model')
-          .eq('line_user_id', targetId)
-          .single();
-        const targetModel = userSetting?.selected_model || 'gemini-3-flash-preview';
+        const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
 
         const response = await ai.models.generateContent({
           model: targetModel,
@@ -1701,13 +1726,8 @@ ${reminderListStr}
         const audioBuffer = Buffer.concat(chunks);
         const base64Audio = audioBuffer.toString('base64');
 
-        // 查詢用戶設定的偏好模型
-        const { data: userSetting } = await supabase
-          .from('users')
-          .select('selected_model')
-          .eq('line_user_id', targetId)
-          .single();
-        const targetModel = userSetting?.selected_model || 'gemini-3-flash-preview';
+        // 決定要使用的偏好模型 (優化版：使用記憶體資料)
+        const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
 
         // --- 語音提醒：先轉寫，再走提醒意圖分析流程 ---
         if (action === 'remindervoc') {
@@ -1729,15 +1749,11 @@ ${reminderListStr}
           const now = new Date();
           const nowStr = now.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
 
-          // 取出對話上下文
-          const { data: userContext } = await supabase
-            .from('users')
-            .select('chat_history')
-            .eq('line_user_id', targetId)
-            .single();
+          // 取出對話上下文 (優化版：使用記憶體資料)
           let contextStr = '';
-          if (userContext && Array.isArray(userContext.chat_history) && userContext.chat_history.length > 0) {
-            const recentHistory = userContext.chat_history.slice(-4);
+          const chatHistory = userRecord?.chat_history;
+          if (chatHistory && Array.isArray(chatHistory) && chatHistory.length > 0) {
+            const recentHistory = chatHistory.slice(-4);
             contextStr = '【近期對話上下文】\n' + recentHistory.filter(h => h && h.role && h.text).map(h => `${h.role === 'user' ? '使用者' : 'AI'}: ${h.text}`).join('\n') + '\n\n';
           }
 
