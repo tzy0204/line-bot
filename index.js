@@ -17,7 +17,97 @@ if (!supabaseUrl || !supabaseKey) {
   process.exit(1);
 }
 
-const supabase = createClient(supabaseUrl, supabaseKey);
+// 方案三：伺服器端最佳化設定 + 15 秒逾時保護
+// - auth.persistSession: false — 伺服器端不需要持久化 session
+// - auth.autoRefreshToken: false — 伺服器端不需要自動刷新 token
+// - global.fetch: 自訂 fetch 加入 15 秒逾時，讓 retry 機制能快速接手
+const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false,
+  },
+  global: {
+    fetch: (url, options = {}) => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 秒逾時
+      return fetch(url, { ...options, signal: controller.signal })
+        .finally(() => clearTimeout(timeoutId));
+    }
+  }
+});
+
+// ==========================================
+// 方案二：通用重試機制 (Exponential Backoff)
+// ==========================================
+
+/**
+ * 判斷是否為可重試的網路/逾時錯誤
+ * @param {Error|Object} error
+ * @returns {boolean}
+ */
+function isRetryableError(error) {
+  if (!error) return false;
+  const msg = (error.message || error.msg || JSON.stringify(error)).toLowerCase();
+  // 網路錯誤、逾時、Cloudflare 5xx 都可以重試
+  return (
+    msg.includes('fetch') ||
+    msg.includes('network') ||
+    msg.includes('timeout') ||
+    msg.includes('aborted') ||
+    msg.includes('522') ||
+    msg.includes('503') ||
+    msg.includes('502') ||
+    msg.includes('econnreset') ||
+    msg.includes('econnrefused') ||
+    msg.includes('etimedout')
+  );
+}
+
+/**
+ * 通用 Supabase 重試包裝器
+ * 失敗時以指數退避策略重試：1s → 2s → 4s（最多 3 次）
+ * @param {Function} fn - 回傳 Supabase query 的 async 函數
+ * @param {number} maxRetries - 最大重試次數（預設 3）
+ * @param {string} label - 用於 log 識別的標籤
+ * @returns {Promise<{data, error}>}
+ */
+async function withRetry(fn, maxRetries = 3, label = 'Supabase') {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await fn();
+      // Supabase SDK 回傳 { data, error } 格式，error 不拋出
+      if (result?.error && isRetryableError(result.error)) {
+        if (attempt < maxRetries) {
+          const delay = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+          console.warn(`[${label}] ⚠️ 第 ${attempt}/${maxRetries} 次嘗試失敗（可重試錯誤），${delay}ms 後重試... 錯誤: ${result.error.message || JSON.stringify(result.error)}`);
+          await new Promise(r => setTimeout(r, delay));
+          lastError = result.error;
+          continue;
+        }
+        console.error(`[${label}] ❌ 已達最大重試次數 (${maxRetries})，最終失敗: ${result.error.message || JSON.stringify(result.error)}`);
+      } else if (result?.error) {
+        // 不可重試的業務邏輯錯誤（如資料驗證失敗），直接回傳
+        console.error(`[${label}] ❌ 非網路錯誤，不重試: ${result.error.message}`);
+      } else if (attempt > 1) {
+        console.log(`[${label}] ✅ 第 ${attempt} 次嘗試成功恢復`);
+      }
+      return result;
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries && isRetryableError(err)) {
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+        console.warn(`[${label}] ⚠️ 第 ${attempt}/${maxRetries} 次拋出異常，${delay}ms 後重試... 錯誤: ${err.message}`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        console.error(`[${label}] ❌ 最終失敗（不可重試或已達上限）: ${err.message}`);
+        throw err;
+      }
+    }
+  }
+  // 所有次數用盡，拋出最後一次的錯誤
+  throw lastError instanceof Error ? lastError : new Error(JSON.stringify(lastError));
+}
 
 // Import Google Gen AI SDK
 const { GoogleGenAI } = require('@google/genai');
@@ -675,16 +765,20 @@ async function handleEvent(event) {
   let userRecord = null;
   if (targetId && (event.type === 'message' || event.type === 'postback')) {
     try {
-      const { data, error } = await supabase
-        .from('users')
-        .select('message_count, chat_history, selected_model, google_refresh_token, is_auth_completed')
-        .eq('line_user_id', targetId)
-        .single();
+      const { data, error } = await withRetry(
+        () => supabase
+          .from('users')
+          .select('message_count, chat_history, selected_model, google_refresh_token, is_auth_completed')
+          .eq('line_user_id', targetId)
+          .single(),
+        3,
+        `Webhook:prefetchUser:${targetId}`
+      );
       if (!error && data) {
         userRecord = data;
       }
     } catch (dbErr) {
-      console.error('Failed to pre-fetch user record from Supabase:', dbErr);
+      console.error(`[Webhook:prefetchUser] ❌ 無法載入用戶資料 (${targetId}):`, dbErr.message);
     }
   }
 
@@ -1052,9 +1146,11 @@ async function handleEvent(event) {
         await client.replyMessage(event.replyToken, [{ type: 'text', text: `📢 正在廣播通知給所有用戶，請稍候...` }]);
 
         // 從資料庫取得所有用戶 ID
-        const { data: allUsers, error: fetchErr } = await supabase
-          .from('users')
-          .select('line_user_id');
+        const { data: allUsers, error: fetchErr } = await withRetry(
+          () => supabase.from('users').select('line_user_id'),
+          3,
+          'Broadcast:fetchAllUsers'
+        );
         
         if (fetchErr || !allUsers?.length) {
           await client.pushMessage(targetId, { type: 'text', text: '❌ 無法取得用戶清單，廣播失敗。' });
@@ -2024,14 +2120,18 @@ cron.schedule('* * * * *', async () => {
   try {
     const now = new Date();
     // 找出所有觸發時間小於等於現在，且尚未通知的提醒事項
-    const { data: dueReminders, error: fetchError } = await supabase
-      .from('reminders')
-      .select('*')
-      .lte('trigger_time', now.toISOString())
-      .eq('is_notified', false);
+    const { data: dueReminders, error: fetchError } = await withRetry(
+      () => supabase
+        .from('reminders')
+        .select('*')
+        .lte('trigger_time', now.toISOString())
+        .eq('is_notified', false),
+      3,
+      'Cron:fetchReminders'
+    );
 
     if (fetchError) {
-      console.error('Cron fetch reminders error:', fetchError);
+      console.error('[Cron:fetchReminders] ❌ 最終失敗，放棄本次週期:', fetchError.message || fetchError);
       return;
     }
 
