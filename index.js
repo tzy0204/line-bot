@@ -762,6 +762,7 @@ async function handleEvent(event) {
         // 放至背景非同步執行
         (async () => {
           const tempFilePath = path.join(os.tmpdir(), `social_video_${Date.now()}.mp4`);
+          let finalFilePath = tempFilePath;
           
           try {
             console.log(`Downloading video from ${videoUrl}`);
@@ -832,17 +833,43 @@ async function handleEvent(event) {
               });
             }
 
-            console.log('Uploading video to Gemini...');
+            // 尋找實際生成的影片檔案 (處理因為缺少 ffmpeg 而導致輸出不同副檔名如 .webm, .mkv 的情況)
+            let fileMimeType = 'video/mp4';
+            if (!fs.existsSync(finalFilePath)) {
+              const dir = path.dirname(tempFilePath);
+              const base = path.basename(tempFilePath, '.mp4');
+              const files = fs.readdirSync(dir);
+              const matchedFile = files.find(f => f.startsWith(base));
+              if (matchedFile) {
+                finalFilePath = path.join(dir, matchedFile);
+                console.log(`Found redirected output file: ${finalFilePath}`);
+                
+                // 動態判斷 MIME 類型
+                if (finalFilePath.endsWith('.webm')) {
+                  fileMimeType = 'video/webm';
+                } else if (finalFilePath.endsWith('.mkv')) {
+                  fileMimeType = 'video/x-matroska';
+                } else if (finalFilePath.endsWith('.mov')) {
+                  fileMimeType = 'video/quicktime';
+                } else if (finalFilePath.endsWith('.3gp')) {
+                  fileMimeType = 'video/3gpp';
+                }
+              } else {
+                throw new Error('找不到下載的影片檔案，下載可能失敗或被中斷。');
+              }
+            }
+
+            console.log(`Uploading video to Gemini (${fileMimeType})...`);
             // Upload using Gen AI File API
             const uploadResponse = await ai.files.upload({
-              file: tempFilePath,
-              mimeType: 'video/mp4',
+              file: finalFilePath,
+              mimeType: fileMimeType,
             });
 
             // 確保取得正確的檔案資訊 (相容不同版本的結構)
             const fileName = uploadResponse.file ? uploadResponse.file.name : uploadResponse.name;
             const fileUri = uploadResponse.file ? uploadResponse.file.uri : uploadResponse.uri;
-            const fileMimeType = uploadResponse.file ? uploadResponse.file.mimeType : (uploadResponse.mimeType || 'video/mp4');
+            fileMimeType = uploadResponse.file ? uploadResponse.file.mimeType : (uploadResponse.mimeType || 'video/mp4');
 
             // 等待影片在後台處理完成 (ACTIVE 狀態)
             let fileState = uploadResponse.file ? uploadResponse.file.state : uploadResponse.state;
@@ -891,8 +918,11 @@ async function handleEvent(event) {
             console.error('Video Processing Error:', err);
             await client.pushMessage(targetId, [{ type: 'text', text: `❌ 處理影片時發生錯誤：\n${err.message}\n\n這可能是因為影片設有隱私限制，或是檔案格式不受支援。` }]);
           } finally {
-            if (fs.existsSync(tempFilePath)) {
-              fs.unlinkSync(tempFilePath);
+            if (finalFilePath && fs.existsSync(finalFilePath)) {
+              try { fs.unlinkSync(finalFilePath); } catch (e) {}
+            }
+            if (fs.existsSync(tempFilePath) && tempFilePath !== finalFilePath) {
+              try { fs.unlinkSync(tempFilePath); } catch (e) {}
             }
           }
         })();
