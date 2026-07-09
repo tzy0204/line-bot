@@ -283,6 +283,28 @@ app.get('/wake-up', (req, res) => {
   console.log('⏰ [UptimeRobot] Ping received. Server is awake!');
   lastWakeUpTime = new Date();
   res.status(200).send('Awake');
+
+  // ==========================================
+  // Supabase 保溫 Ping（Fire-and-forget，不阻塞回應）
+  // ==========================================
+  // Supabase Free Tier 在 7 天無活動後會暫停資料庫。
+  // 冷啟動需要 20~25 秒，Cloudflare 等不到就回 Error 522。
+  // 此處搭著 UptimeRobot 每 5 分鐘的 ping，對 Supabase 送一個
+  // 輕量級的 SELECT 1 查詢，讓 DB 保持熱機狀態。
+  supabase
+    .from('system_logs')
+    .select('id', { count: 'exact', head: true })
+    .limit(1)
+    .then(({ error }) => {
+      if (error) {
+        console.warn('[Supabase:KeepAlive] ⚠️ 保溫 ping 失敗 (DB 可能正在冷啟動):', error.message);
+      } else {
+        console.log('[Supabase:KeepAlive] ✅ 保溫 ping 成功，DB 處於熱機狀態');
+      }
+    })
+    .catch(err => {
+      console.warn('[Supabase:KeepAlive] ⚠️ 保溫 ping 例外:', err.message);
+    });
 });
 
 // --- Google OAuth2 Setup ---
