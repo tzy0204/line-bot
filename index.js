@@ -914,8 +914,8 @@ async function handleEvent(event) {
                 
                 // 檢查 Content-Length 限制 (15MB)
                 const contentLength = response.headers.get('content-length');
-                if (contentLength && parseInt(contentLength, 10) > 50 * 1024 * 1024) {
-                  throw new Error('影片檔案過大，請勿傳送大於 50MB 的影片以避免系統過載。');
+                if (contentLength && parseInt(contentLength, 10) > 200 * 1024 * 1024) {
+                  throw new Error('影片檔案過大，請勿傳送大於 200MB 的影片以避免系統過載。');
                 }
 
                 const { Readable } = require('stream');
@@ -927,8 +927,8 @@ async function handleEvent(event) {
                 const limitStream = new (require('stream').Transform)({
                   transform(chunk, encoding, callback) {
                     downloadedBytes += chunk.length;
-                    if (downloadedBytes > 50 * 1024 * 1024) {
-                      callback(new Error('影片檔案過大，請勿傳送大於 50MB 的影片以避免系統過載。'));
+                    if (downloadedBytes > 200 * 1024 * 1024) {
+                      callback(new Error('影片檔案過大，請勿傳送大於 200MB 的影片以避免系統過載。'));
                     } else {
                       callback(null, chunk);
                     }
@@ -948,7 +948,7 @@ async function handleEvent(event) {
               await youtubedl(videoUrl, {
                 output: tempFilePath,
                 format: 'worst[ext=mp4]/best[height<=360]', // 限制解析度以降低 CPU/記憶體/頻寬負載
-                maxFilesize: '50m', // 限制最大 50MB 避免 OOM 崩潰
+                maxFilesize: '200m', // 限制最大 200MB 避免 OOM 崩潰
                 ffmpegLocation: ffmpegPath, // 讓雲端環境 (Render) 可以正確合成音訊與影像
                 noCheckCertificates: true,
                 noWarnings: true
@@ -977,7 +977,7 @@ async function handleEvent(event) {
                   fileMimeType = 'video/3gpp';
                 }
               } else {
-                throw new Error('找不到下載的影片檔案，下載可能失敗或被中斷。這可能是因為影片超過了 50MB 限制，或是影片設有隱私限制。');
+                throw new Error('找不到下載的影片檔案，下載可能失敗或被中斷。這可能是因為影片超過了 200MB 限制，或是影片設有隱私限制。');
               }
             }
 
@@ -1784,8 +1784,8 @@ ${reminderListStr}
         let totalLength = 0;
         for await (const chunk of stream) {
           totalLength += chunk.length;
-          if (totalLength > 50 * 1024 * 1024) { // 50MB 限制
-            throw new Error('影片檔案過大，請發送小於 50MB 的影片以避免系統過載。');
+          if (totalLength > 200 * 1024 * 1024) { // 200MB 限制
+            throw new Error('影片檔案過大，請發送小於 200MB 的影片以避免系統過載。');
           }
           chunks.push(chunk);
         }
