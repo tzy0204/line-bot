@@ -884,9 +884,9 @@ async function handleEvent(event) {
             console.log(`Downloading video from ${videoUrl}`);
             let downloadSuccess = false;
 
-            // 針對 YouTube 與 Threads 使用 btch-downloader 以避開 yt-dlp 的驗證問題或不支援
-            if (videoUrl.includes('threads.net') || videoUrl.includes('threads.com') || videoUrl.includes('youtube.com') || videoUrl.includes('youtu.be')) {
-              console.log('Using btch-downloader for Threads / YouTube');
+            // 針對 YouTube, Threads 與 Facebook 使用 btch-downloader 以避開 yt-dlp 的驗證問題或不支援
+            if (videoUrl.includes('threads.net') || videoUrl.includes('threads.com') || videoUrl.includes('youtube.com') || videoUrl.includes('youtu.be') || videoUrl.includes('facebook.com') || videoUrl.includes('fb.watch') || videoUrl.includes('fb.gg')) {
+              console.log('Using btch-downloader for Threads / YouTube / Facebook');
               const btch = require('btch-downloader');
               let directUrl = null;
               let normalizedVideoUrl = videoUrl;
@@ -899,6 +899,10 @@ async function handleEvent(event) {
               if (normalizedVideoUrl.includes('threads')) {
                 const res = await btch.threads(normalizedVideoUrl);
                 directUrl = res?.result?.video;
+              } else if (normalizedVideoUrl.includes('facebook.com') || normalizedVideoUrl.includes('fb.watch') || normalizedVideoUrl.includes('fb.gg')) {
+                const res = await btch.fbdown(normalizedVideoUrl);
+                // 預先取得 Normal 畫質以降低檔案大小，若無則取 HD
+                directUrl = res?.Normal_video || res?.HD;
               } else {
                 const res = await btch.youtube(normalizedVideoUrl);
                 directUrl = res?.mp4;
@@ -910,8 +914,8 @@ async function handleEvent(event) {
                 
                 // 檢查 Content-Length 限制 (15MB)
                 const contentLength = response.headers.get('content-length');
-                if (contentLength && parseInt(contentLength, 10) > 15 * 1024 * 1024) {
-                  throw new Error('影片檔案過大，請勿傳送大於 15MB 的影片以避免系統過載。');
+                if (contentLength && parseInt(contentLength, 10) > 50 * 1024 * 1024) {
+                  throw new Error('影片檔案過大，請勿傳送大於 50MB 的影片以避免系統過載。');
                 }
 
                 const { Readable } = require('stream');
@@ -923,8 +927,8 @@ async function handleEvent(event) {
                 const limitStream = new (require('stream').Transform)({
                   transform(chunk, encoding, callback) {
                     downloadedBytes += chunk.length;
-                    if (downloadedBytes > 15 * 1024 * 1024) {
-                      callback(new Error('影片檔案過大，請勿傳送大於 15MB 的影片以避免系統過載。'));
+                    if (downloadedBytes > 50 * 1024 * 1024) {
+                      callback(new Error('影片檔案過大，請勿傳送大於 50MB 的影片以避免系統過載。'));
                     } else {
                       callback(null, chunk);
                     }
@@ -940,10 +944,12 @@ async function handleEvent(event) {
 
             // 預設使用 youtube-dl-exec (支援 Facebook, IG, TikTok, YouTube 等大部分平台)
             if (!downloadSuccess) {
+              const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
               await youtubedl(videoUrl, {
                 output: tempFilePath,
                 format: 'worst[ext=mp4]/best[height<=360]', // 限制解析度以降低 CPU/記憶體/頻寬負載
-                maxFilesize: '15m', // 限制最大 15MB 避免 OOM 崩潰
+                maxFilesize: '50m', // 限制最大 50MB 避免 OOM 崩潰
+                ffmpegLocation: ffmpegPath, // 讓雲端環境 (Render) 可以正確合成音訊與影像
                 noCheckCertificates: true,
                 noWarnings: true
               });
@@ -971,7 +977,7 @@ async function handleEvent(event) {
                   fileMimeType = 'video/3gpp';
                 }
               } else {
-                throw new Error('找不到下載的影片檔案，下載可能失敗或被中斷。');
+                throw new Error('找不到下載的影片檔案，下載可能失敗或被中斷。這可能是因為影片超過了 50MB 限制，或是影片設有隱私限制。');
               }
             }
 
@@ -1778,8 +1784,8 @@ ${reminderListStr}
         let totalLength = 0;
         for await (const chunk of stream) {
           totalLength += chunk.length;
-          if (totalLength > 15 * 1024 * 1024) { // 15MB 限制
-            throw new Error('影片檔案過大，請發送小於 15MB 的影片以避免系統過載。');
+          if (totalLength > 50 * 1024 * 1024) { // 50MB 限制
+            throw new Error('影片檔案過大，請發送小於 50MB 的影片以避免系統過載。');
           }
           chunks.push(chunk);
         }
@@ -2162,10 +2168,14 @@ cron.schedule('* * * * *', async () => {
 
       for (const reminder of dueReminders) {
         // 主動推播訊息
-        await client.pushMessage(reminder.line_user_id, [{
-          type: 'text',
-          text: `⏰ 溫馨提醒：\n時間到囉！\n\n👉 ${reminder.task}`
-        }]);
+        try {
+          await client.pushMessage(reminder.line_user_id, [{
+            type: 'text',
+            text: `⏰ 溫馨提醒：\n時間到囉！\n\n👉 ${reminder.task}`
+          }]);
+        } catch (pushErr) {
+          console.error(`❌ 無法發送提醒給 ${reminder.line_user_id}:`, pushErr.message || pushErr);
+        }
 
         let updatePayload = {};
 
