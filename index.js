@@ -879,6 +879,7 @@ async function handleEvent(event) {
         (async () => {
           const tempFilePath = path.join(os.tmpdir(), `social_video_${Date.now()}.mp4`);
           let finalFilePath = tempFilePath;
+          let uploadedGeminiFileName = null;
           
           try {
             console.log(`Downloading video from ${videoUrl}`);
@@ -990,6 +991,7 @@ async function handleEvent(event) {
 
             // 確保取得正確的檔案資訊 (相容不同版本的結構)
             const fileName = uploadResponse.file ? uploadResponse.file.name : uploadResponse.name;
+            uploadedGeminiFileName = fileName;
             const fileUri = uploadResponse.file ? uploadResponse.file.uri : uploadResponse.uri;
             fileMimeType = uploadResponse.file ? uploadResponse.file.mimeType : (uploadResponse.mimeType || 'video/mp4');
 
@@ -1045,6 +1047,14 @@ async function handleEvent(event) {
             }
             if (fs.existsSync(tempFilePath) && tempFilePath !== finalFilePath) {
               try { fs.unlinkSync(tempFilePath); } catch (e) {}
+            }
+            if (uploadedGeminiFileName) {
+              try {
+                await ai.files.delete({ name: uploadedGeminiFileName });
+                console.log(`Deleted video from Gemini: ${uploadedGeminiFileName}`);
+              } catch (e) {
+                console.error(`Failed to delete video from Gemini:`, e);
+              }
             }
           }
         })();
