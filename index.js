@@ -1152,8 +1152,10 @@ async function handleEvent(event) {
 💡 **後續關注：**
 [用一句話總結這件事的影響，或未來該注意什麼]
 
-# 新聞文本：
-\${markdownContent}`;
+# 待摘要的新聞文本：
+\${markdownContent}
+
+👉 **請務必直接輸出上方新聞文本的摘要結果，絕對不要回覆「請提供文本」或「我了解了」。直接給出摘要！**`;
 
                 const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
                 const aiResponse = await ai.models.generateContent({
