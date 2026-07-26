@@ -127,6 +127,24 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const app = express();
 
 // ==========================================
+// 新聞快取與輔助函數
+// ==========================================
+const newsCache = new Map();
+
+function getCleanUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    u.searchParams.delete('fbclid');
+    u.searchParams.delete('utm_source');
+    u.searchParams.delete('utm_medium');
+    u.searchParams.delete('utm_campaign');
+    return u.toString();
+  } catch (e) {
+    return rawUrl;
+  }
+}
+
+// ==========================================
 // 共用函數分享區
 // ==========================================
 
@@ -1060,6 +1078,111 @@ async function handleEvent(event) {
         })();
         
         return;
+      }
+
+      // --- 📰 新聞/一般網頁連結偵測與處理 (Jina Reader API) ---
+      const urlRegex = /(https?:\/\/[^\s]+)/i;
+      const urlMatch = userText.match(urlRegex);
+      if (urlMatch) {
+        const rawUrl = urlMatch[1];
+        
+        // 過濾明顯非新聞的，讓後續意圖判斷去處理
+        if (rawUrl.includes('drive.google.com') || rawUrl.includes('shopee.tw')) {
+          // 放行至意圖判斷
+        } else {
+          await client.replyMessage(event.replyToken, [{ type: 'text', text: '📰 正在為您閱讀並摘要文章內容，請稍候...' }]);
+          
+          (async () => {
+            try {
+              const cleanUrl = getCleanUrl(rawUrl);
+              const nowMs = Date.now();
+              let summaryText = '';
+
+              // 檢查快取 (30 mins TTL)
+              if (newsCache.has(cleanUrl)) {
+                const cached = newsCache.get(cleanUrl);
+                if (nowMs < cached.expireAt) {
+                  summaryText = cached.text;
+                  console.log(`[News Cache] Hit for: ${cleanUrl}`);
+                } else {
+                  newsCache.delete(cleanUrl);
+                }
+              }
+
+              if (!summaryText) {
+                console.log(`[News] Fetching Jina Reader for: ${cleanUrl}`);
+                const jinaResponse = await fetch(`https://r.jina.ai/${cleanUrl}`);
+                
+                if (jinaResponse.status === 429) {
+                  console.warn('[Warning] Jina Reader API 已達使用次數上限 (HTTP 429)。請評估申請免費 API Key 或進入付費階段。');
+                  throw new Error('閱讀服務目前忙碌中，請稍後再試。');
+                }
+                if (!jinaResponse.ok) {
+                  throw new Error(`擷取文章失敗 (${jinaResponse.status})`);
+                }
+
+                const markdownContent = await jinaResponse.text();
+                if (markdownContent.length < 50) {
+                  throw new Error('無法擷取有效文章內容，可能設有付費牆或防護機制。');
+                }
+
+                const newsPrompt = `# Role
+你是一個專為手機通訊軟體（LINE）設計的專業新聞摘要助理。你的目標是將長篇新聞濃縮成「一滑就能看完」的精華，並保持客觀、精煉的語氣。
+
+# Constraints
+1. 絕對精簡：總字數嚴格限制在 200 字以內。
+2. 禁止廢話：不要輸出任何開場白或結語。
+3. 強制留白：每個段落與條列項目之間，必須強制保留一個空白行（\\n\\n）。
+4. 封閉文本限制：只能依據提供的文本進行摘要，禁止使用預先訓練知識。
+5. 數據絕對忠實：所有數字、金額、日期必須「100% 照抄原文」。
+6. 客觀轉述視角：請使用「報導指出」等轉述語氣。
+7. 如果這是一篇購物網站、系統登入頁、檔案目錄或毫無意義的亂碼，請不要進行摘要，並直接回覆：「這似乎不是一篇新聞文章，請提供有效的新聞連結喔！」
+
+# Output Format (強制填空)
+📰 **[用一句話總結新聞主旨，不超過 20 個字]**
+
+📌 **核心重點：**
+
+🔹 [重點一：濃縮成 1-2 句話，直擊核心數字或事實]
+
+🔹 [重點二：濃縮成 1-2 句話，說明背景或衝突點]
+
+🔹 [重點三：濃縮成 1-2 句話，補充關鍵細節]
+
+💡 **後續關注：**
+[用一句話總結這件事的影響，或未來該注意什麼]
+
+# 新聞文本：
+\${markdownContent}`;
+
+                const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
+                const aiResponse = await ai.models.generateContent({
+                  model: targetModel,
+                  contents: newsPrompt
+                });
+                
+                summaryText = aiResponse.text || '無法生成摘要';
+
+                // 快取結果 (30 mins TTL)，若非文章則不快取
+                if (!summaryText.includes('這似乎不是一篇新聞文章')) {
+                  newsCache.set(cleanUrl, {
+                    text: summaryText,
+                    expireAt: nowMs + 30 * 60 * 1000
+                  });
+                }
+              }
+
+              await client.pushMessage(targetId, [{ type: 'text', text: summaryText }]);
+              await saveChatHistory(targetId, userText, `[已為使用者摘要新聞] \${summaryText}`);
+
+            } catch (err) {
+              console.error('News Processing Error:', err);
+              await client.pushMessage(targetId, [{ type: 'text', text: `❌ 處理新聞時發生錯誤：\\n\${err.message}` }]);
+            }
+          })();
+          
+          return;
+        }
       }
 
       // --- 🗞️ 今日晨報 — 從 Supabase 拉取 my_agent 採集的每日晨報 ---
