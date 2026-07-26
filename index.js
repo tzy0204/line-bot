@@ -1136,7 +1136,7 @@ async function handleEvent(event) {
 4. 封閉文本限制：只能依據提供的文本進行摘要，禁止使用預先訓練知識。
 5. 數據絕對忠實：所有數字、金額、日期必須「100% 照抄原文」。
 6. 客觀轉述視角：請使用「報導指出」等轉述語氣。
-7. 盡力摘要：不管前面有多少導覽列或雜訊，只要找出正文，就盡力進行摘要。只有在「完全找不到任何文章內容」的情況下，才可以回覆：「這似乎不是一篇新聞文章」。
+7. 忽略雜訊：文本中可能包含大量導覽列、廣告或社群連結，請直接忽略它們，主動往下尋找真正的新聞內文進行摘要。絕對不要因為開頭的雜訊而放棄摘要。
 
 # Output Format (強制填空)
 📰 **[用一句話總結新聞主旨，不超過 20 個字]**
@@ -1163,8 +1163,8 @@ async function handleEvent(event) {
                 
                 summaryText = aiResponse.text || '無法生成摘要';
 
-                // 快取結果 (30 mins TTL)，若非文章則不快取
-                if (!summaryText.includes('這似乎不是一篇新聞文章')) {
+                // 快取結果 (30 mins TTL)
+                if (summaryText.length > 10) {
                   newsCache.set(cleanUrl, {
                     text: summaryText,
                     expireAt: nowMs + 30 * 60 * 1000
