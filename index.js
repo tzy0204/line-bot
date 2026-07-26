@@ -1090,43 +1090,40 @@ async function handleEvent(event) {
         if (rawUrl.includes('drive.google.com') || rawUrl.includes('shopee.tw')) {
           // 放行至意圖判斷
         } else {
-          await client.replyMessage(event.replyToken, [{ type: 'text', text: '📰 正在為您閱讀並摘要文章內容，請稍候...' }]);
-          
-          (async () => {
-            try {
-              const cleanUrl = getCleanUrl(rawUrl);
-              const nowMs = Date.now();
-              let summaryText = '';
+          try {
+            const cleanUrl = getCleanUrl(rawUrl);
+            const nowMs = Date.now();
+            let summaryText = '';
 
-              // 檢查快取 (30 mins TTL)
-              if (newsCache.has(cleanUrl)) {
-                const cached = newsCache.get(cleanUrl);
-                if (nowMs < cached.expireAt) {
-                  summaryText = cached.text;
-                  console.log(`[News Cache] Hit for: ${cleanUrl}`);
-                } else {
-                  newsCache.delete(cleanUrl);
-                }
+            // 檢查快取 (30 mins TTL)
+            if (newsCache.has(cleanUrl)) {
+              const cached = newsCache.get(cleanUrl);
+              if (nowMs < cached.expireAt) {
+                summaryText = cached.text;
+                console.log(`[News Cache] Hit for: ${cleanUrl}`);
+              } else {
+                newsCache.delete(cleanUrl);
+              }
+            }
+
+            if (!summaryText) {
+              console.log(`[News] Fetching Jina Reader for: ${cleanUrl}`);
+              const jinaResponse = await fetch(`https://r.jina.ai/${cleanUrl}`);
+              
+              if (jinaResponse.status === 429) {
+                console.warn('[Warning] Jina Reader API 已達使用次數上限 (HTTP 429)。請評估申請免費 API Key 或進入付費階段。');
+                throw new Error('閱讀服務目前忙碌中，請稍後再試。');
+              }
+              if (!jinaResponse.ok) {
+                throw new Error(`擷取文章失敗 (${jinaResponse.status})`);
               }
 
-              if (!summaryText) {
-                console.log(`[News] Fetching Jina Reader for: ${cleanUrl}`);
-                const jinaResponse = await fetch(`https://r.jina.ai/${cleanUrl}`);
-                
-                if (jinaResponse.status === 429) {
-                  console.warn('[Warning] Jina Reader API 已達使用次數上限 (HTTP 429)。請評估申請免費 API Key 或進入付費階段。');
-                  throw new Error('閱讀服務目前忙碌中，請稍後再試。');
-                }
-                if (!jinaResponse.ok) {
-                  throw new Error(`擷取文章失敗 (${jinaResponse.status})`);
-                }
+              const markdownContent = await jinaResponse.text();
+              if (markdownContent.length < 50) {
+                throw new Error('無法擷取有效文章內容，可能設有付費牆或防護機制。');
+              }
 
-                const markdownContent = await jinaResponse.text();
-                if (markdownContent.length < 50) {
-                  throw new Error('無法擷取有效文章內容，可能設有付費牆或防護機制。');
-                }
-
-                const newsPrompt = `# Role
+              const newsPrompt = `# Role
 你是一個專為手機通訊軟體（LINE）設計的專業新聞摘要助理。你的目標是將長篇新聞濃縮成「一滑就能看完」的精華，並保持客觀、精煉的語氣。
 
 # Constraints
@@ -1157,31 +1154,30 @@ async function handleEvent(event) {
 
 👉 **請務必直接輸出上方新聞文本的摘要結果，絕對不要回覆「請提供文本」或「我了解了」。直接給出摘要！**`;
 
-                const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
-                const aiResponse = await ai.models.generateContent({
-                  model: targetModel,
-                  contents: newsPrompt
+              const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
+              const aiResponse = await ai.models.generateContent({
+                model: targetModel,
+                contents: newsPrompt
+              });
+              
+              summaryText = aiResponse.text || '無法生成摘要';
+
+              // 快取結果 (30 mins TTL)
+              if (summaryText.length > 10) {
+                newsCache.set(cleanUrl, {
+                  text: summaryText,
+                  expireAt: nowMs + 30 * 60 * 1000
                 });
-                
-                summaryText = aiResponse.text || '無法生成摘要';
-
-                // 快取結果 (30 mins TTL)
-                if (summaryText.length > 10) {
-                  newsCache.set(cleanUrl, {
-                    text: summaryText,
-                    expireAt: nowMs + 30 * 60 * 1000
-                  });
-                }
               }
-
-              await client.pushMessage(targetId, [{ type: 'text', text: summaryText }]);
-              await saveChatHistory(targetId, userText, `[已為使用者摘要新聞] \${summaryText}`);
-
-            } catch (err) {
-              console.error('News Processing Error:', err);
-              await client.pushMessage(targetId, [{ type: 'text', text: `❌ 處理新聞時發生錯誤：\\n\${err.message}` }]);
             }
-          })();
+
+            await client.replyMessage(event.replyToken, [{ type: 'text', text: summaryText }]);
+            await saveChatHistory(targetId, userText, `[已為使用者摘要新聞] \${summaryText}`);
+
+          } catch (err) {
+            console.error('News Processing Error:', err);
+            await client.replyMessage(event.replyToken, [{ type: 'text', text: `❌ 處理新聞時發生錯誤：\\n\${err.message}` }]);
+          }
           
           return;
         }
