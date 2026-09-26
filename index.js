@@ -144,6 +144,23 @@ function getCleanUrl(rawUrl) {
   }
 }
 
+// 清理文字中的 Markdown 符號與多餘格式，以利語音讀屏軟體無障礙朗讀
+function sanitizeForAccessibility(text) {
+  if (!text || typeof text !== 'string') return text;
+  return text
+    // 移除 markdown 粗體與斜體（例如 **文字** 或 *文字*）
+    .replace(/\*\*(.*?)\*\*/g, '$1')
+    .replace(/\*(.*?)\*/g, '$1')
+    // 移除行首的 Markdown 標題符號（例如 ### 標題）
+    .replace(/^#{1,6}\s*/gm, '')
+    // 移除行首的 Markdown 列表符號（例如 * 項目、- 項目、+ 項目）
+    .replace(/^[\s]*[\*\-\+]\s+/gm, '')
+    // 移除反引號（例如 `程式碼` 轉成 「程式碼」）
+    .replace(/`([^`]+)`/g, '「$1」')
+    .replace(/`/g, '')
+    .trim();
+}
+
 // ==========================================
 // 共用函數分享區
 // ==========================================
@@ -1053,7 +1070,8 @@ async function handleEvent(event) {
               }
             });
 
-            const replyText = aiResponse.text || '無法生成摘要';
+            const rawReplyText = aiResponse.text || '無法生成摘要';
+            const replyText = sanitizeForAccessibility(rawReplyText);
             await client.pushMessage(targetId, [{ type: 'text', text: `🎬 【影片摘要】\n\n${replyText}` }]);
             await saveChatHistory(targetId, userText, `[已為使用者摘要影片] ${replyText}`);
             
@@ -1135,11 +1153,12 @@ async function handleEvent(event) {
 5. 數據絕對忠實：所有數字、金額、日期必須「100% 照抄原文」。
 6. 客觀轉述視角：請使用「報導指出」等轉述語氣。
 7. 忽略雜訊：文本中可能包含大量導覽列、廣告或社群連結，請直接忽略它們，主動往下尋找真正的新聞內文進行摘要。絕對不要因為開頭的雜訊而放棄摘要。
+8. 無障礙排版指示：為了友善視障用戶使用語音讀屏軟體，請「絕對不要」使用任何 Markdown 符號（例如 *星號、**粗體**、-橫槓、#井號等）來進行排版。
 
 # Output Format (強制填空)
-📰 **[用一句話總結新聞主旨，不超過 20 個字]**
+📰 [用一句話總結新聞主旨，不超過 20 個字]
 
-📌 **核心重點：**
+📌 核心重點：
 
 🔹 [重點一：濃縮成 1-2 句話，直擊核心數字或事實]
 
@@ -1147,13 +1166,13 @@ async function handleEvent(event) {
 
 🔹 [重點三：濃縮成 1-2 句話，補充關鍵細節]
 
-💡 **後續關注：**
+💡 後續關注：
 [用一句話總結這件事的影響，或未來該注意什麼]
 
 # 待摘要的新聞文本：
 \${markdownContent}
 
-👉 **請務必直接輸出上方新聞文本的摘要結果，絕對不要回覆「請提供文本」或「我了解了」。直接給出摘要！**`;
+👉 請務必直接輸出上方新聞文本的摘要結果，絕對不要回覆「請提供文本」或「我了解了」。直接給出摘要！`;
 
               const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
               const aiResponse = await ai.models.generateContent({
@@ -1161,7 +1180,7 @@ async function handleEvent(event) {
                 contents: newsPrompt
               });
               
-              summaryText = aiResponse.text || '無法生成摘要';
+              summaryText = sanitizeForAccessibility(aiResponse.text || '無法生成摘要');
 
               // 快取結果 (30 mins TTL)
               if (summaryText.length > 10) {
@@ -1733,6 +1752,16 @@ ${reminderListStr}
             }];
           }
 
+          const accessibilityInstruction = `\n\n⚠️【無障礙純文字排版守則】⚠️
+為了友善視障用戶使用語音讀屏軟體（Screen Reader），所有回覆內容「絕對禁止」使用任何 Markdown 排版符號與格式：
+1. 嚴禁使用星號粗體或斜體（例如 **文字**、*文字*）。
+2. 嚴禁使用橫槓、星號或加號做為列表項目符號（例如 - 項目、* 項目、+ 項目）。
+3. 嚴禁使用井號（#）作為標題。
+4. 嚴禁使用反引號（\`）。
+5. 請直接使用繁體中文、清晰自然段落、適當換行與中文全形標點符號（如逗號、句號、頓號、引號）來組織訊息與條列重點。確保語音讀屏軟體朗讀時順暢乾淨，無任何多餘符號干擾。`;
+
+          systemInstruction += accessibilityInstruction;
+
           const chatConfig = { systemInstruction };
           if (tools) chatConfig.tools = tools;
 
@@ -1788,7 +1817,8 @@ ${reminderListStr}
             });
           }
 
-          const replyText = chatResponse.text || '好的，我記下來了！';
+          const rawChatReply = chatResponse.text || '好的，我記下來了！';
+          const replyText = sanitizeForAccessibility(rawChatReply);
 
           // 更新短期記憶
           await saveChatHistory(targetId, userText, replyText);
@@ -1825,7 +1855,7 @@ ${reminderListStr}
 【輸出格式要求】
 請務必嚴格輸出合法的 JSON 格式，不要包含 Markdown 語法或其餘閒聊，JSON 結構如下：
 {
-  "description": "這裡是針對圖片的繁體中文分析與萃取出的所有細節重點，自然友善的語氣",
+  "description": "這裡是針對圖片的繁體中文分析與萃取出的所有細節重點，語氣自然友善。請注意無障礙排版：嚴禁使用任何 Markdown 符號（如 * 星號、- 橫槓、# 井號、粗體符號），請直接使用自然段落與中文全形標點符號排版",
   "has_events": true 或者是 false (如果圖片中包含任何未來事件或預約，請設為 true),
   "reminders": [
     // 只有當 has_events 為 true 時才需要填寫。請針對每一個獨立事件給出 3 個時段建議：
@@ -1874,6 +1904,8 @@ ${reminderListStr}
         } catch (e) {
           replyText = response.text;
         }
+
+        replyText = sanitizeForAccessibility(replyText);
 
         // 第一則訊息：圖片描述
         messages.push({ type: 'text', text: replyText });
@@ -1943,8 +1975,9 @@ ${reminderListStr}
           ]
         });
 
-        await saveChatHistory(targetId, "[使用者傳送了一段影片]", response.text);
-        await client.replyMessage(event.replyToken, [{ type: 'text', text: response.text }]);
+        const replyText = sanitizeForAccessibility(response.text || '收到影片了！');
+        await saveChatHistory(targetId, "[使用者傳送了一段影片]", replyText);
+        await client.replyMessage(event.replyToken, [{ type: 'text', text: replyText }]);
         logToSupabase('Webhook', 'Success', `Video processed for user ${targetId}`, targetId).catch(console.error);
         return;
       } catch (err) {
@@ -2153,7 +2186,8 @@ ${reminderListStr}
           ]
         });
 
-        const replyText = response.text || '語音處理完成。';
+        const rawAudioReply = response.text || '語音處理完成。';
+        const replyText = sanitizeForAccessibility(rawAudioReply);
         
         // 根據不同 Action 設定 User 歷史記憶的代表文字
         const userActionText = action === 'polish' 
