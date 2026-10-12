@@ -1105,9 +1105,24 @@ async function handleEvent(event) {
       if (urlMatch) {
         const rawUrl = urlMatch[1];
         
-        // 過濾明顯非新聞的，讓後續意圖判斷去處理
-        if (rawUrl.includes('drive.google.com') || rawUrl.includes('shopee.tw')) {
-          // 放行至意圖判斷
+        // 1. 若內容包含提醒、行程、通知等關鍵字，應放行給 AI 意圖分析處理（保留網址於任務內）
+        const reminderKeywords = ['提醒', '叫我', '通知', '聚會', '吃飯', '行程', '約會', '開會', '會議', '出發', '幾點', '記得', '預約', '備忘'];
+        const isReminderIntent = reminderKeywords.some(kw => userText.includes(kw));
+
+        // 2. 過濾明顯非新聞的網址（雲端硬碟、電商、地圖導航等）
+        const nonNewsDomains = [
+          'drive.google.com',
+          'shopee.tw',
+          'maps.google.com',
+          'google.com/maps',
+          'maps.app.goo.gl',
+          'goo.gl/maps',
+          'waze.com'
+        ];
+        const isNonNewsUrl = nonNewsDomains.some(domain => rawUrl.toLowerCase().includes(domain));
+
+        if (isReminderIntent || isNonNewsUrl) {
+          // 放行至意圖判斷 (例如建立提醒、日常問答等)
         } else {
           try {
             const cleanUrl = getCleanUrl(rawUrl);
