@@ -917,135 +917,137 @@ async function handleEvent(event) {
           let uploadedGeminiFileName = null;
           
           try {
-            console.log(`Downloading video from ${videoUrl}`);
-            let downloadSuccess = false;
-
-            // 針對 YouTube, Threads 與 Facebook 使用 btch-downloader 以避開 yt-dlp 的驗證問題或不支援
-            if (videoUrl.includes('threads.net') || videoUrl.includes('threads.com') || videoUrl.includes('youtube.com') || videoUrl.includes('youtu.be') || videoUrl.includes('facebook.com') || videoUrl.includes('fb.watch') || videoUrl.includes('fb.gg')) {
-              console.log('Using btch-downloader for Threads / YouTube / Facebook');
-              const btch = require('btch-downloader');
-              let directUrl = null;
-              let normalizedVideoUrl = videoUrl;
-
-              // btch-downloader 不支援 m.youtube.com 格式，需要轉換為 www.youtube.com
-              if (normalizedVideoUrl.includes('m.youtube.com')) {
-                normalizedVideoUrl = normalizedVideoUrl.replace('m.youtube.com', 'www.youtube.com');
-              }
-
-              if (normalizedVideoUrl.includes('threads')) {
-                const res = await btch.threads(normalizedVideoUrl);
-                directUrl = res?.result?.video;
-              } else if (normalizedVideoUrl.includes('facebook.com') || normalizedVideoUrl.includes('fb.watch') || normalizedVideoUrl.includes('fb.gg')) {
-                const res = await btch.fbdown(normalizedVideoUrl);
-                // 預先取得 Normal 畫質以降低檔案大小，若無則取 HD
-                directUrl = res?.Normal_video || res?.HD;
-              } else {
-                const res = await btch.youtube(normalizedVideoUrl);
-                directUrl = res?.mp4;
-              }
-              
-              if (directUrl) {
-                const response = await fetch(directUrl);
-                if (!response.ok) throw new Error(`Unexpected response ${response.statusText}`);
-                
-                // 檢查 Content-Length 限制 (15MB)
-                const contentLength = response.headers.get('content-length');
-                if (contentLength && parseInt(contentLength, 10) > 200 * 1024 * 1024) {
-                  throw new Error('影片檔案過大，請勿傳送大於 200MB 的影片以避免系統過載。');
-                }
-
-                const { Readable } = require('stream');
-                const { finished } = require('stream/promises');
-                const fileStream = require('fs').createWriteStream(tempFilePath, { flags: 'wx' });
-                
-                // 限制串流寫入大小，避免 header 缺失時下載超大檔案
-                let downloadedBytes = 0;
-                const limitStream = new (require('stream').Transform)({
-                  transform(chunk, encoding, callback) {
-                    downloadedBytes += chunk.length;
-                    if (downloadedBytes > 200 * 1024 * 1024) {
-                      callback(new Error('影片檔案過大，請勿傳送大於 200MB 的影片以避免系統過載。'));
-                    } else {
-                      callback(null, chunk);
-                    }
-                  }
-                });
-
-                await finished(Readable.fromWeb(response.body).pipe(limitStream).pipe(fileStream));
-                downloadSuccess = true;
-              } else {
-                console.log('btch-downloader returned no video URL, falling back to youtubedl...');
-              }
-            }
-
-            // 預設使用 youtube-dl-exec (支援 Facebook, IG, TikTok, YouTube 等大部分平台)
-            if (!downloadSuccess) {
-              const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-              await youtubedl(videoUrl, {
-                output: tempFilePath,
-                format: 'worst[ext=mp4]/best[height<=360]', // 限制解析度以降低 CPU/記憶體/頻寬負載
-                maxFilesize: '200m', // 限制最大 200MB 避免 OOM 崩潰
-                ffmpegLocation: ffmpegPath, // 讓雲端環境 (Render) 可以正確合成音訊與影像
-                noCheckCertificates: true,
-                noWarnings: true
-              });
-            }
-
-            // 尋找實際生成的影片檔案 (處理因為缺少 ffmpeg 而導致輸出不同副檔名如 .webm, .mkv 的情況)
+            let fileUri = null;
             let fileMimeType = 'video/mp4';
-            if (!fs.existsSync(finalFilePath)) {
-              const dir = path.dirname(tempFilePath);
-              const base = path.basename(tempFilePath, '.mp4');
-              const files = fs.readdirSync(dir);
-              const matchedFile = files.find(f => f.startsWith(base));
-              if (matchedFile) {
-                finalFilePath = path.join(dir, matchedFile);
-                console.log(`Found redirected output file: ${finalFilePath}`);
-                
-                // 動態判斷 MIME 類型
-                if (finalFilePath.endsWith('.webm')) {
-                  fileMimeType = 'video/webm';
-                } else if (finalFilePath.endsWith('.mkv')) {
-                  fileMimeType = 'video/x-matroska';
-                } else if (finalFilePath.endsWith('.mov')) {
-                  fileMimeType = 'video/quicktime';
-                } else if (finalFilePath.endsWith('.3gp')) {
-                  fileMimeType = 'video/3gpp';
+            const isYouTube = videoUrl.includes('youtube.com') || videoUrl.includes('youtu.be');
+
+            if (isYouTube) {
+              // Gemini API 原生支援直接傳入公開的 YouTube 網址，無需透過 yt-dlp / btch-downloader 下載再上傳
+              const ytIdMatch = videoUrl.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|live\/|embed\/|v\/))([a-zA-Z0-9_-]{11})/);
+              fileUri = ytIdMatch ? `https://www.youtube.com/watch?v=${ytIdMatch[1]}` : videoUrl;
+              console.log(`Using direct YouTube URL for Gemini: ${fileUri}`);
+            } else {
+              console.log(`Downloading video from ${videoUrl}`);
+              let downloadSuccess = false;
+
+              // 針對 Threads 與 Facebook 使用 btch-downloader 以避開 yt-dlp 的驗證問題或不支援
+              if (videoUrl.includes('threads.net') || videoUrl.includes('threads.com') || videoUrl.includes('facebook.com') || videoUrl.includes('fb.watch') || videoUrl.includes('fb.gg')) {
+                console.log('Using btch-downloader for Threads / Facebook');
+                const btch = require('btch-downloader');
+                let directUrl = null;
+                let normalizedVideoUrl = videoUrl;
+
+                if (normalizedVideoUrl.includes('threads')) {
+                  const res = await btch.threads(normalizedVideoUrl);
+                  directUrl = res?.result?.video;
+                } else if (normalizedVideoUrl.includes('facebook.com') || normalizedVideoUrl.includes('fb.watch') || normalizedVideoUrl.includes('fb.gg')) {
+                  const res = await btch.fbdown(normalizedVideoUrl);
+                  // 預先取得 Normal 畫質以降低檔案大小，若無則取 HD
+                  directUrl = res?.Normal_video || res?.HD;
                 }
-              } else {
-                throw new Error('找不到下載的影片檔案，下載可能失敗或被中斷。這可能是因為影片超過了 200MB 限制，或是影片設有隱私限制。');
+                
+                if (directUrl) {
+                  const response = await fetch(directUrl);
+                  if (!response.ok) throw new Error(`Unexpected response ${response.statusText}`);
+                  
+                  // 檢查 Content-Length 限制 (200MB)
+                  const contentLength = response.headers.get('content-length');
+                  if (contentLength && parseInt(contentLength, 10) > 200 * 1024 * 1024) {
+                    throw new Error('影片檔案過大，請勿傳送大於 200MB 的影片以避免系統過載。');
+                  }
+
+                  const { Readable } = require('stream');
+                  const { finished } = require('stream/promises');
+                  const fileStream = require('fs').createWriteStream(tempFilePath, { flags: 'wx' });
+                  
+                  // 限制串流寫入大小，避免 header 缺失時下載超大檔案
+                  let downloadedBytes = 0;
+                  const limitStream = new (require('stream').Transform)({
+                    transform(chunk, encoding, callback) {
+                      downloadedBytes += chunk.length;
+                      if (downloadedBytes > 200 * 1024 * 1024) {
+                        callback(new Error('影片檔案過大，請勿傳送大於 200MB 的影片以避免系統過載。'));
+                      } else {
+                        callback(null, chunk);
+                      }
+                    }
+                  });
+
+                  await finished(Readable.fromWeb(response.body).pipe(limitStream).pipe(fileStream));
+                  downloadSuccess = true;
+                } else {
+                  console.log('btch-downloader returned no video URL, falling back to youtubedl...');
+                }
               }
-            }
 
-            console.log(`Uploading video to Gemini (${fileMimeType})...`);
-            // Upload using Gen AI File API
-            const uploadResponse = await ai.files.upload({
-              file: finalFilePath,
-              mimeType: fileMimeType,
-            });
+              // 預設使用 youtube-dl-exec (支援 Facebook, IG, TikTok 等大部分平台)
+              if (!downloadSuccess) {
+                const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
+                await youtubedl(videoUrl, {
+                  output: tempFilePath,
+                  format: 'worst[ext=mp4]/best[height<=360]', // 限制解析度以降低 CPU/記憶體/頻寬負載
+                  maxFilesize: '200m', // 限制最大 200MB 避免 OOM 崩潰
+                  ffmpegLocation: ffmpegPath, // 讓雲端環境 (Render) 可以正確合成音訊與影像
+                  noCheckCertificates: true,
+                  noWarnings: true
+                });
+              }
 
-            // 確保取得正確的檔案資訊 (相容不同版本的結構)
-            const fileName = uploadResponse.file ? uploadResponse.file.name : uploadResponse.name;
-            uploadedGeminiFileName = fileName;
-            const fileUri = uploadResponse.file ? uploadResponse.file.uri : uploadResponse.uri;
-            fileMimeType = uploadResponse.file ? uploadResponse.file.mimeType : (uploadResponse.mimeType || 'video/mp4');
+              // 尋找實際生成的影片檔案 (處理因為缺少 ffmpeg 而導致輸出不同副檔名如 .webm, .mkv 的情況)
+              if (!fs.existsSync(finalFilePath)) {
+                const dir = path.dirname(tempFilePath);
+                const base = path.basename(tempFilePath, '.mp4');
+                const files = fs.readdirSync(dir);
+                const matchedFile = files.find(f => f.startsWith(base));
+                if (matchedFile) {
+                  finalFilePath = path.join(dir, matchedFile);
+                  console.log(`Found redirected output file: ${finalFilePath}`);
+                  
+                  // 動態判斷 MIME 類型
+                  if (finalFilePath.endsWith('.webm')) {
+                    fileMimeType = 'video/webm';
+                  } else if (finalFilePath.endsWith('.mkv')) {
+                    fileMimeType = 'video/x-matroska';
+                  } else if (finalFilePath.endsWith('.mov')) {
+                    fileMimeType = 'video/quicktime';
+                  } else if (finalFilePath.endsWith('.3gp')) {
+                    fileMimeType = 'video/3gpp';
+                  }
+                } else {
+                  throw new Error('找不到下載的影片檔案，下載可能失敗或被中斷。這可能是因為影片超過了 200MB 限制，或是影片設有隱私限制。');
+                }
+              }
 
-            // 等待影片在後台處理完成 (ACTIVE 狀態)
-            let fileState = uploadResponse.file ? uploadResponse.file.state : uploadResponse.state;
-            let retries = 0;
-            while (fileState === 'PROCESSING' && retries < 12) {
-              console.log(`Video processing in Gemini... (${retries + 1}/12)`);
-              await new Promise(resolve => setTimeout(resolve, 5000));
-              const getFileResponse = await ai.files.get({ name: fileName });
-              fileState = getFileResponse.file ? getFileResponse.file.state : getFileResponse.state;
-              retries++;
-            }
+              console.log(`Uploading video to Gemini (${fileMimeType})...`);
+              // Upload using Gen AI File API
+              const uploadResponse = await ai.files.upload({
+                file: finalFilePath,
+                mimeType: fileMimeType,
+              });
 
-            if (fileState === 'FAILED') {
-              throw new Error('Gemini 處理影片檔案失敗');
-            }
-            if (fileState === 'PROCESSING') {
-              throw new Error('Gemini 處理影片超時');
+              // 確保取得正確的檔案資訊 (相容不同版本的結構)
+              const fileName = uploadResponse.file ? uploadResponse.file.name : uploadResponse.name;
+              uploadedGeminiFileName = fileName;
+              fileUri = uploadResponse.file ? uploadResponse.file.uri : uploadResponse.uri;
+              fileMimeType = uploadResponse.file ? uploadResponse.file.mimeType : (uploadResponse.mimeType || 'video/mp4');
+
+              // 等待影片在後台處理完成 (ACTIVE 狀態)
+              let fileState = uploadResponse.file ? uploadResponse.file.state : uploadResponse.state;
+              let retries = 0;
+              while (fileState === 'PROCESSING' && retries < 12) {
+                console.log(`Video processing in Gemini... (${retries + 1}/12)`);
+                await new Promise(resolve => setTimeout(resolve, 5000));
+                const getFileResponse = await ai.files.get({ name: fileName });
+                fileState = getFileResponse.file ? getFileResponse.file.state : getFileResponse.state;
+                retries++;
+              }
+
+              if (fileState === 'FAILED') {
+                throw new Error('Gemini 處理影片檔案失敗');
+              }
+              if (fileState === 'PROCESSING') {
+                throw new Error('Gemini 處理影片超時');
+              }
             }
 
             const prompt = `您是一位專業的內容查核與事實分析專家。
