@@ -929,11 +929,41 @@ async function handleEvent(event) {
             } else {
               console.log(`Downloading video from ${videoUrl}`);
               let downloadSuccess = false;
+              const btch = require('btch-downloader');
+
+              const downloadFromDirectUrl = async (directUrl) => {
+                const response = await fetch(directUrl);
+                if (!response.ok) throw new Error(`Unexpected response ${response.statusText}`);
+
+                // 檢查 Content-Length 限制 (200MB)
+                const contentLength = response.headers.get('content-length');
+                if (contentLength && parseInt(contentLength, 10) > 200 * 1024 * 1024) {
+                  throw new Error('影片檔案過大，請勿傳送大於 200MB 的影片以避免系統過載。');
+                }
+
+                const { Readable } = require('stream');
+                const { finished } = require('stream/promises');
+                const fileStream = require('fs').createWriteStream(tempFilePath, { flags: 'w' });
+
+                // 限制串流寫入大小，避免 header 缺失時下載超大檔案
+                let downloadedBytes = 0;
+                const limitStream = new (require('stream').Transform)({
+                  transform(chunk, encoding, callback) {
+                    downloadedBytes += chunk.length;
+                    if (downloadedBytes > 200 * 1024 * 1024) {
+                      callback(new Error('影片檔案過大，請勿傳送大於 200MB 的影片以避免系統過載。'));
+                    } else {
+                      callback(null, chunk);
+                    }
+                  }
+                });
+
+                await finished(Readable.fromWeb(response.body).pipe(limitStream).pipe(fileStream));
+              };
 
               // 針對 Threads 與 Facebook 使用 btch-downloader 以避開 yt-dlp 的驗證問題或不支援
               if (videoUrl.includes('threads.net') || videoUrl.includes('threads.com') || videoUrl.includes('facebook.com') || videoUrl.includes('fb.watch') || videoUrl.includes('fb.gg')) {
                 console.log('Using btch-downloader for Threads / Facebook');
-                const btch = require('btch-downloader');
                 let directUrl = null;
                 let normalizedVideoUrl = videoUrl;
 
@@ -941,56 +971,93 @@ async function handleEvent(event) {
                   const res = await btch.threads(normalizedVideoUrl);
                   directUrl = res?.result?.video;
                 } else if (normalizedVideoUrl.includes('facebook.com') || normalizedVideoUrl.includes('fb.watch') || normalizedVideoUrl.includes('fb.gg')) {
-                  const res = await btch.fbdown(normalizedVideoUrl);
-                  // 預先取得 Normal 畫質以降低檔案大小，若無則取 HD
-                  directUrl = res?.Normal_video || res?.HD;
+                  // 先嘗試解析 Facebook 短網址 / share 轉址以取得實際影片 ID
+                  let resolvedFbUrl = normalizedVideoUrl;
+                  try {
+                    if (normalizedVideoUrl.includes('/share/') || normalizedVideoUrl.includes('fb.watch') || normalizedVideoUrl.includes('fb.gg')) {
+                      const redirectRes = await fetch(normalizedVideoUrl, {
+                        method: 'GET',
+                        redirect: 'manual',
+                        headers: { 'User-Agent': 'facebookexternalhit/1.1' }
+                      });
+                      const loc = redirectRes.headers.get('location');
+                      if (loc) {
+                        resolvedFbUrl = loc;
+                        if (resolvedFbUrl.includes('/login/') && resolvedFbUrl.includes('next=')) {
+                          const parsedLoc = new URL(resolvedFbUrl);
+                          const nextParam = parsedLoc.searchParams.get('next');
+                          if (nextParam) resolvedFbUrl = nextParam;
+                        }
+                      }
+                    }
+                  } catch (redirectErr) {
+                    console.warn('Failed to pre-resolve FB redirect:', redirectErr.message);
+                  }
+
+                  const fbIdMatch =
+                    resolvedFbUrl.match(/[?&](?:v|story_fbid)=(\d{10,25})/) ||
+                    resolvedFbUrl.match(/\/(?:videos|reel|reels|posts|permalink)\/(?:[^\/]+\/)?(\d{10,25})/) ||
+                    normalizedVideoUrl.match(/[?&](?:v|story_fbid)=(\d{10,25})/) ||
+                    normalizedVideoUrl.match(/\/(?:videos|reel|reels|posts|permalink)\/(?:[^\/]+\/)?(\d{10,25})/);
+
+                  const fbCandidates = [];
+                  if (fbIdMatch) {
+                    // 正規化為 watch/?v=ID 格式（相容 posts、permalink、reel、群組貼文等格式）
+                    fbCandidates.push(`https://www.facebook.com/watch/?v=${fbIdMatch[1]}`);
+                  }
+                  if (!fbCandidates.includes(resolvedFbUrl)) {
+                    fbCandidates.push(resolvedFbUrl);
+                  }
+                  if (!fbCandidates.includes(normalizedVideoUrl)) {
+                    fbCandidates.push(normalizedVideoUrl);
+                  }
+
+                  for (const candidateUrl of fbCandidates) {
+                    console.log(`Trying btch.fbdown with: ${candidateUrl}`);
+                    const res = await btch.fbdown(candidateUrl);
+                    directUrl = res?.Normal_video || res?.HD;
+                    if (directUrl) break;
+                  }
                 }
                 
                 if (directUrl) {
-                  const response = await fetch(directUrl);
-                  if (!response.ok) throw new Error(`Unexpected response ${response.statusText}`);
-                  
-                  // 檢查 Content-Length 限制 (200MB)
-                  const contentLength = response.headers.get('content-length');
-                  if (contentLength && parseInt(contentLength, 10) > 200 * 1024 * 1024) {
-                    throw new Error('影片檔案過大，請勿傳送大於 200MB 的影片以避免系統過載。');
-                  }
-
-                  const { Readable } = require('stream');
-                  const { finished } = require('stream/promises');
-                  const fileStream = require('fs').createWriteStream(tempFilePath, { flags: 'wx' });
-                  
-                  // 限制串流寫入大小，避免 header 缺失時下載超大檔案
-                  let downloadedBytes = 0;
-                  const limitStream = new (require('stream').Transform)({
-                    transform(chunk, encoding, callback) {
-                      downloadedBytes += chunk.length;
-                      if (downloadedBytes > 200 * 1024 * 1024) {
-                        callback(new Error('影片檔案過大，請勿傳送大於 200MB 的影片以避免系統過載。'));
-                      } else {
-                        callback(null, chunk);
-                      }
-                    }
-                  });
-
-                  await finished(Readable.fromWeb(response.body).pipe(limitStream).pipe(fileStream));
+                  await downloadFromDirectUrl(directUrl);
                   downloadSuccess = true;
                 } else {
                   console.log('btch-downloader returned no video URL, falling back to youtubedl...');
                 }
               }
 
-              // 預設使用 youtube-dl-exec (支援 Facebook, IG, TikTok 等大部分平台)
+              // 預設使用 youtube-dl-exec (支援 IG, TikTok 等大部分平台，以及作為備援)
               if (!downloadSuccess) {
                 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-                await youtubedl(videoUrl, {
-                  output: tempFilePath,
-                  format: 'worst[ext=mp4]/best[height<=360]', // 限制解析度以降低 CPU/記憶體/頻寬負載
-                  maxFilesize: '200m', // 限制最大 200MB 避免 OOM 崩潰
-                  ffmpegLocation: ffmpegPath, // 讓雲端環境 (Render) 可以正確合成音訊與影像
-                  noCheckCertificates: true,
-                  noWarnings: true
-                });
+                try {
+                  await youtubedl(videoUrl, {
+                    output: tempFilePath,
+                    format: 'worst[ext=mp4]/best[height<=360]', // 限制解析度以降低 CPU/記憶體/頻寬負載
+                    maxFilesize: '200m', // 限制最大 200MB 避免 OOM 崩潰
+                    ffmpegLocation: ffmpegPath, // 讓雲端環境 (Render) 可以正確合成音訊與影像
+                    noCheckCertificates: true,
+                    noWarnings: true
+                  });
+                } catch (ytdlErr) {
+                  // 若 yt-dlp 解析 Facebook 失敗但錯誤訊息中已解析出影片 ID (例如 ERROR: [facebook] 27791062450560762: Cannot parse data)，用該 ID 再呼叫 btch.fbdown 救援
+                  const fbErrIdMatch = (ytdlErr.message || '').match(/\[facebook[^\]]*\]\s*(\d{10,25}):/i);
+                  if (fbErrIdMatch) {
+                    const fallbackWatchUrl = `https://www.facebook.com/watch/?v=${fbErrIdMatch[1]}`;
+                    console.log(`Recovering FB video via btch.fbdown using ID from yt-dlp error: ${fallbackWatchUrl}`);
+                    const rescueRes = await btch.fbdown(fallbackWatchUrl);
+                    const rescueDirectUrl = rescueRes?.Normal_video || rescueRes?.HD;
+                    if (rescueDirectUrl) {
+                      await downloadFromDirectUrl(rescueDirectUrl);
+                      downloadSuccess = true;
+                    } else {
+                      throw ytdlErr;
+                    }
+                  } else {
+                    throw ytdlErr;
+                  }
+                }
               }
 
               // 尋找實際生成的影片檔案 (處理因為缺少 ffmpeg 而導致輸出不同副檔名如 .webm, .mkv 的情況)
