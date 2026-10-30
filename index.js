@@ -1168,11 +1168,15 @@ async function handleEvent(event) {
         return;
       }
 
-      // --- 📰 新聞/一般網頁連結偵測與處理 (Jina Reader API) ---
-      const urlRegex = /(https?:\/\/[^\s]+)/i;
+      // --- 📰 新聞/一般網頁連結偵測與處理 (Jina Reader API + 備援擷取) ---
+      const urlRegex = /(https?:\/\/[a-zA-Z0-9\-._~:\/?#\[\]@!$&'()*+,;=%]+)/i;
       const urlMatch = userText.match(urlRegex);
       if (urlMatch) {
-        const rawUrl = urlMatch[1];
+        let rawUrl = urlMatch[1].replace(/[.,;:!?]+$/, '');
+        // 若網址結尾有多餘的右括號（例如 (https://example.com)），予以剝除
+        while (rawUrl.endsWith(')') && (rawUrl.match(/\(/g) || []).length < (rawUrl.match(/\)/g) || []).length) {
+          rawUrl = rawUrl.slice(0, -1);
+        }
         
         // 1. 若內容包含提醒、行程、通知等關鍵字，應放行給 AI 意圖分析處理（保留網址於任務內）
         const reminderKeywords = ['提醒', '叫我', '通知', '聚會', '吃飯', '行程', '約會', '開會', '會議', '出發', '幾點', '記得', '預約', '備忘'];
@@ -1193,6 +1197,15 @@ async function handleEvent(event) {
         if (isReminderIntent || isNonNewsUrl) {
           // 放行至意圖判斷 (例如建立提醒、日常問答等)
         } else {
+          const replyOrPush = async (messages) => {
+            try {
+              await client.replyMessage(event.replyToken, messages);
+            } catch (replyErr) {
+              console.warn('[News] replyMessage 失敗 (可能因 replyToken 逾時)，改用 pushMessage:', replyErr.message);
+              await client.pushMessage(targetId, messages);
+            }
+          };
+
           try {
             const cleanUrl = getCleanUrl(rawUrl);
             const nowMs = Date.now();
@@ -1210,34 +1223,92 @@ async function handleEvent(event) {
             }
 
             if (!summaryText) {
-              console.log(`[News] Fetching Jina Reader for: ${cleanUrl}`);
-              const jinaResponse = await fetch(`https://r.jina.ai/${cleanUrl}`);
-              
-              if (jinaResponse.status === 429) {
-                console.warn('[Warning] Jina Reader API 已達使用次數上限 (HTTP 429)。請評估申請免費 API Key 或進入付費階段。');
-                throw new Error('閱讀服務目前忙碌中，請稍後再試。');
-              }
-              if (!jinaResponse.ok) {
-                throw new Error(`擷取文章失敗 (${jinaResponse.status})`);
+              let markdownContent = '';
+
+              // 第一層：嘗試使用 Jina Reader API (設定 12 秒逾時避免卡住 replyToken)
+              try {
+                console.log(`[News] Fetching Jina Reader for: ${cleanUrl}`);
+                const jinaController = new AbortController();
+                const jinaTimeout = setTimeout(() => jinaController.abort(), 12000);
+                const jinaResponse = await fetch(`https://r.jina.ai/${cleanUrl}`, {
+                  signal: jinaController.signal
+                }).finally(() => clearTimeout(jinaTimeout));
+
+                if (jinaResponse.status === 429) {
+                  console.warn('[Warning] Jina Reader API 已達使用次數上限 (HTTP 429)，切換至備援擷取。');
+                } else if (jinaResponse.ok) {
+                  const jinaText = await jinaResponse.text();
+                  if (jinaText && jinaText.trim().length >= 80) {
+                    markdownContent = jinaText.slice(0, 30000);
+                  }
+                } else {
+                  console.warn(`[News] Jina Reader 回傳非 200 狀態碼 (${jinaResponse.status})，切換至備援擷取。`);
+                }
+              } catch (jinaErr) {
+                console.warn(`[News] Jina Reader 擷取失敗 (${jinaErr.message})，切換至備援擷取。`);
               }
 
-              const markdownContent = await jinaResponse.text();
-              if (markdownContent.length < 50) {
-                throw new Error('無法擷取有效文章內容，可能設有付費牆或防護機制。');
+              // 第二層備援：若 Jina 失敗，直接抓取原始網頁 HTML 萃取標題、Meta 與段落內文
+              if (!markdownContent) {
+                try {
+                  console.log(`[News] Fallback direct HTML fetch for: ${cleanUrl}`);
+                  const htmlController = new AbortController();
+                  const htmlTimeout = setTimeout(() => htmlController.abort(), 8000);
+                  const htmlRes = await fetch(cleanUrl, {
+                    signal: htmlController.signal,
+                    headers: {
+                      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                      'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'
+                    }
+                  }).finally(() => clearTimeout(htmlTimeout));
+
+                  if (htmlRes.ok) {
+                    const rawHtml = await htmlRes.text();
+                    const titleMatch = rawHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+                    const ogDescMatch = rawHtml.match(/<meta[^>]+(?:property|name)=["'](?:og:description|description)["'][^>]+content=["']([^"']+)["']/i)
+                      || rawHtml.match(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:description|description)["']/i);
+                    const bodyText = rawHtml
+                      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+                      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+                      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+                      .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
+                      .replace(/<\/(p|div|h[1-6]|li|br|article|section)>/gi, '\n')
+                      .replace(/<[^>]+>/g, ' ')
+                      .replace(/&nbsp;/gi, ' ')
+                      .replace(/&amp;/gi, '&')
+                      .replace(/&quot;/gi, '"')
+                      .replace(/[ \t]+/g, ' ')
+                      .replace(/\n{3,}/g, '\n\n')
+                      .trim();
+
+                    const combined = [
+                      titleMatch ? `標題：${titleMatch[1].trim()}` : '',
+                      ogDescMatch ? `摘要：${ogDescMatch[1].trim()}` : '',
+                      bodyText
+                    ].filter(Boolean).join('\n\n');
+
+                    if (combined.length >= 120) {
+                      markdownContent = combined.slice(0, 30000);
+                    }
+                  }
+                } catch (htmlErr) {
+                  console.warn(`[News] Direct HTML fetch 失敗 (${htmlErr.message})，改用 Gemini urlContext 備援。`);
+                }
               }
 
-              const newsPrompt = `# Role
+              const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
+              const baseFormatRules = `# Role
 你是一個專為手機通訊軟體（LINE）設計的專業新聞摘要助理。你的目標是將長篇新聞濃縮成「一滑就能看完」的精華，並保持客觀、精煉的語氣。
 
 # Constraints
 1. 絕對精簡：總字數嚴格限制在 200 字以內。
 2. 禁止廢話：不要輸出任何開場白或結語。
-3. 強制留白：每個段落與條列項目之間，必須強制保留一個空白行（\\n\\n）。
-4. 封閉文本限制：只能依據提供的文本進行摘要，禁止使用預先訓練知識。
-5. 數據絕對忠實：所有數字、金額、日期必須「100% 照抄原文」。
-6. 客觀轉述視角：請使用「報導指出」等轉述語氣。
-7. 忽略雜訊：文本中可能包含大量導覽列、廣告或社群連結，請直接忽略它們，主動往下尋找真正的新聞內文進行摘要。絕對不要因為開頭的雜訊而放棄摘要。
-8. 無障礙排版指示：為了友善視障用戶使用語音讀屏軟體，請「絕對不要」使用任何 Markdown 符號（例如 *星號、**粗體**、-橫槓、#井號等）來進行排版。
+3. 強制留白：每個段落與條列項目之間，必須強制保留一個空白行。
+4. 數據絕對忠實：所有數字、金額、日期必須「100% 照抄原文」。
+5. 客觀轉述視角：請使用「報導指出」等轉述語氣。
+6. 忽略雜訊：文本中可能包含大量導覽列、廣告或社群連結，請直接忽略它們，主動往下尋找真正的新聞內文進行摘要。絕對不要因為開頭的雜訊而放棄摘要。
+7. 無障礙排版指示：為了友善視障用戶使用語音讀屏軟體，請「絕對不要」使用任何 Markdown 符號（例如 *星號、**粗體**、-橫槓、#井號等）來進行排版。
 
 # Output Format (強制填空)
 📰 [用一句話總結新聞主旨，不超過 20 個字]
@@ -1251,18 +1322,39 @@ async function handleEvent(event) {
 🔹 [重點三：濃縮成 1-2 句話，補充關鍵細節]
 
 💡 後續關注：
-[用一句話總結這件事的影響，或未來該注意什麼]
+[用一句話總結這件事的影響，或未來該注意什麼]`;
+
+              let aiResponse;
+              if (markdownContent) {
+                const newsPrompt = `${baseFormatRules}
 
 # 待摘要的新聞文本：
-\${markdownContent}
+${markdownContent}
 
-👉 請務必直接輸出上方新聞文本的摘要結果，絕對不要回覆「請提供文本」或「我了解了」。直接給出摘要！`;
+👉 請務必嚴格依據上方提供的新聞文本直接輸出摘要結果，禁止使用預先訓練知識，也絕對不要回覆「請提供文本」或「我了解了」。直接給出摘要！`;
 
-              const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
-              const aiResponse = await ai.models.generateContent({
-                model: targetModel,
-                contents: newsPrompt
-              });
+                aiResponse = await ai.models.generateContent({
+                  model: targetModel,
+                  contents: newsPrompt
+                });
+              } else {
+                // 第三層備援：若網站阻擋爬蟲 (如 Cloudflare / 429)，交由 Gemini 原生 urlContext 與 Google Search 讀取該網址
+                console.log(`[News] Fallback to Gemini urlContext + googleSearch for: ${cleanUrl}`);
+                const urlPrompt = `${baseFormatRules}
+
+# 待摘要的新聞網址：
+${cleanUrl}
+
+👉 請直接讀取並查詢上方網址的新聞內容，並嚴格依照上述格式直接輸出摘要結果，絕對不要回覆「請提供文本」或「我了解了」。`;
+
+                aiResponse = await ai.models.generateContent({
+                  model: targetModel,
+                  contents: urlPrompt,
+                  config: {
+                    tools: [{ urlContext: {} }, { googleSearch: {} }]
+                  }
+                });
+              }
               
               summaryText = sanitizeForAccessibility(aiResponse.text || '無法生成摘要');
 
@@ -1275,12 +1367,12 @@ async function handleEvent(event) {
               }
             }
 
-            await client.replyMessage(event.replyToken, [{ type: 'text', text: summaryText }]);
-            await saveChatHistory(targetId, userText, `[已為使用者摘要新聞] \${summaryText}`);
+            await replyOrPush([{ type: 'text', text: summaryText }]);
+            await saveChatHistory(targetId, userText, `[已為使用者摘要新聞] ${summaryText}`);
 
           } catch (err) {
             console.error('News Processing Error:', err);
-            await client.replyMessage(event.replyToken, [{ type: 'text', text: `❌ 處理新聞時發生錯誤：\\n\${err.message}` }]);
+            await replyOrPush([{ type: 'text', text: `❌ 處理新聞時發生錯誤：\n${err.message}` }]);
           }
           
           return;
