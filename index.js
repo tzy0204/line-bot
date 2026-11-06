@@ -900,15 +900,22 @@ async function handleEvent(event) {
     if (event.type === 'message' && event.message.type === 'text') {
       const userText = event.message.text.trim();
 
-      // --- 社群影片連結偵測與處理 (Facebook, Threads, IG, TikTok 等) ---
+      // 提醒關鍵字清單（若訊息包含提醒意圖，應放行給 AI 意圖分析處理，不攔截為影片或新聞摘要）
+      const reminderKeywords = ['提醒', '叫我', '通知', '聚會', '吃飯', '行程', '約會', '開會', '會議', '出發', '幾點', '記得', '預約', '備忘'];
+      const isReminderIntent = reminderKeywords.some(kw => userText.includes(kw));
+
+      // --- 社群影片與貼文連結偵測與處理 (Facebook, Threads, IG, TikTok, YouTube, X 等) ---
       const videoRegex = /(https?:\/\/(?:[a-zA-Z0-9-]+\.)*(?:facebook\.com|fb\.watch|fb\.gg|threads\.net|threads\.com|instagram\.com|tiktok\.com|youtube\.com|youtu\.be|x\.com|twitter\.com)\/[a-zA-Z0-9\-._~:\/?#\[\]@!$&'()*+,;=%]+)/i;
-      const videoMatch = userText.match(videoRegex);
+      const videoMatch = !isReminderIntent ? userText.match(videoRegex) : null;
 
       if (videoMatch) {
-        const videoUrl = videoMatch[1];
+        let videoUrl = videoMatch[1].replace(/[.,;:!?]+$/, '');
+        while (videoUrl.endsWith(')') && (videoUrl.match(/\(/g) || []).length < (videoUrl.match(/\)/g) || []).length) {
+          videoUrl = videoUrl.slice(0, -1);
+        }
         
         // 先回覆使用者正在處理中
-        await client.replyMessage(event.replyToken, [{ type: 'text', text: '🔄 正在擷取影片並生成摘要，這可能需要幾十秒鐘，請稍候...' }]);
+        await client.replyMessage(event.replyToken, [{ type: 'text', text: '🔄 正在擷取內容並生成摘要與查核，這可能需要幾十秒鐘，請稍候...' }]);
         
         // 放至背景非同步執行
         (async () => {
@@ -919,7 +926,11 @@ async function handleEvent(event) {
           try {
             let fileUri = null;
             let fileMimeType = 'video/mp4';
+            let resolvedSocialUrl = videoUrl;
+            let detectedFbId = null;
             const isYouTube = videoUrl.includes('youtube.com') || videoUrl.includes('youtu.be');
+            // 明確為 Facebook 圖文/相片貼文的網址（無需浪費時間呼叫 yt-dlp 下載影片）
+            const isExplicitPhotoOrPost = videoUrl.includes('/share/p/') || videoUrl.includes('/photo');
 
             if (isYouTube) {
               // Gemini API 原生支援直接傳入公開的 YouTube 網址，無需透過 yt-dlp / btch-downloader 下載再上傳
@@ -927,13 +938,21 @@ async function handleEvent(event) {
               fileUri = ytIdMatch ? `https://www.youtube.com/watch?v=${ytIdMatch[1]}` : videoUrl;
               console.log(`Using direct YouTube URL for Gemini: ${fileUri}`);
             } else {
-              console.log(`Downloading video from ${videoUrl}`);
+              console.log(`Processing social media URL: ${videoUrl}`);
               let downloadSuccess = false;
               const btch = require('btch-downloader');
+              const triedFbWatchUrls = new Set();
 
               const downloadFromDirectUrl = async (directUrl) => {
-                const response = await fetch(directUrl);
+                const dlController = new AbortController();
+                const dlTimeout = setTimeout(() => dlController.abort(), 30000);
+                const response = await fetch(directUrl, { signal: dlController.signal }).finally(() => clearTimeout(dlTimeout));
                 if (!response.ok) throw new Error(`Unexpected response ${response.statusText}`);
+
+                const contentType = (response.headers.get('content-type') || '').toLowerCase();
+                if (contentType.startsWith('image/') || contentType.includes('text/html')) {
+                  throw new Error(`Direct URL returned non-video content-type: ${contentType}`);
+                }
 
                 // 檢查 Content-Length 限制 (200MB)
                 const contentLength = response.headers.get('content-length');
@@ -961,163 +980,207 @@ async function handleEvent(event) {
                 await finished(Readable.fromWeb(response.body).pipe(limitStream).pipe(fileStream));
               };
 
-              // 針對 Threads 與 Facebook 使用 btch-downloader 以避開 yt-dlp 的驗證問題或不支援
-              if (videoUrl.includes('threads.net') || videoUrl.includes('threads.com') || videoUrl.includes('facebook.com') || videoUrl.includes('fb.watch') || videoUrl.includes('fb.gg')) {
-                console.log('Using btch-downloader for Threads / Facebook');
-                let directUrl = null;
-                let normalizedVideoUrl = videoUrl;
+              // 先解析 Facebook 短網址 / share 轉址以取得實際貼文或影片網址
+              if (videoUrl.includes('facebook.com') || videoUrl.includes('fb.watch') || videoUrl.includes('fb.gg')) {
+                try {
+                  if (videoUrl.includes('/share/') || videoUrl.includes('fb.watch') || videoUrl.includes('fb.gg')) {
+                    const redirectRes = await fetch(videoUrl, {
+                      method: 'GET',
+                      redirect: 'manual',
+                      headers: { 'User-Agent': 'facebookexternalhit/1.1' }
+                    });
+                    const loc = redirectRes.headers.get('location');
+                    if (loc) {
+                      resolvedSocialUrl = loc;
+                      if (resolvedSocialUrl.includes('/login/') && resolvedSocialUrl.includes('next=')) {
+                        const parsedLoc = new URL(resolvedSocialUrl);
+                        const nextParam = parsedLoc.searchParams.get('next');
+                        if (nextParam) resolvedSocialUrl = nextParam;
+                      }
+                    }
+                  }
+                } catch (redirectErr) {
+                  console.warn('Failed to pre-resolve FB redirect:', redirectErr.message);
+                }
 
-                if (normalizedVideoUrl.includes('threads')) {
-                  const res = await btch.threads(normalizedVideoUrl);
-                  directUrl = res?.result?.video;
-                } else if (normalizedVideoUrl.includes('facebook.com') || normalizedVideoUrl.includes('fb.watch') || normalizedVideoUrl.includes('fb.gg')) {
-                  // 先嘗試解析 Facebook 短網址 / share 轉址以取得實際影片 ID
-                  let resolvedFbUrl = normalizedVideoUrl;
+                const fbIdMatch =
+                  resolvedSocialUrl.match(/[?&](?:v|story_fbid)=(\d{10,25})/) ||
+                  resolvedSocialUrl.match(/\/(?:videos|reel|reels|posts|permalink)\/(?:[^\/]+\/)?(\d{10,25})/) ||
+                  videoUrl.match(/[?&](?:v|story_fbid)=(\d{10,25})/) ||
+                  videoUrl.match(/\/(?:videos|reel|reels|posts|permalink)\/(?:[^\/]+\/)?(\d{10,25})/);
+                if (fbIdMatch) {
+                  detectedFbId = fbIdMatch[1];
+                }
+              }
+
+              // 若非明確的純圖文相片網址，先嘗試以 btch-downloader 與 yt-dlp 下載影片
+              if (!isExplicitPhotoOrPost) {
+                try {
+                  let directUrl = null;
+
+                  if (videoUrl.includes('threads.net') || videoUrl.includes('threads.com')) {
+                    console.log('Using btch-downloader for Threads');
+                    const res = await btch.threads(videoUrl);
+                    directUrl = res?.result?.video;
+                  } else if (videoUrl.includes('facebook.com') || videoUrl.includes('fb.watch') || videoUrl.includes('fb.gg')) {
+                    console.log('Using btch-downloader for Facebook');
+                    const fbCandidates = [];
+                    if (detectedFbId) {
+                      fbCandidates.push(`https://www.facebook.com/watch/?v=${detectedFbId}`);
+                    }
+                    if (!fbCandidates.includes(resolvedSocialUrl)) {
+                      fbCandidates.push(resolvedSocialUrl);
+                    }
+                    if (!fbCandidates.includes(videoUrl)) {
+                      fbCandidates.push(videoUrl);
+                    }
+
+                    for (const candidateUrl of fbCandidates) {
+                      try {
+                        console.log(`Trying btch.fbdown with: ${candidateUrl}`);
+                        triedFbWatchUrls.add(candidateUrl);
+                        const res = await btch.fbdown(candidateUrl);
+                        const candidateDirectUrl = res?.Normal_video || res?.HD;
+                        if (candidateDirectUrl) {
+                          directUrl = candidateDirectUrl;
+                          break;
+                        }
+                      } catch (fbCandidateErr) {
+                        console.warn(`btch.fbdown candidate failed (${candidateUrl}):`, fbCandidateErr.message);
+                      }
+                    }
+                  } else if (videoUrl.includes('instagram.com')) {
+                    console.log('Using btch-downloader for Instagram');
+                    const res = await btch.igdl(videoUrl);
+                    directUrl = res?.result?.[0]?.url;
+                  } else if (videoUrl.includes('tiktok.com')) {
+                    console.log('Using btch-downloader for TikTok');
+                    const res = await btch.ttdl(videoUrl);
+                    directUrl = Array.isArray(res?.video) ? res.video[0] : res?.video;
+                  } else if (videoUrl.includes('x.com') || videoUrl.includes('twitter.com')) {
+                    console.log('Using btch-downloader for X/Twitter');
+                    const res = await btch.twitter(videoUrl);
+                    directUrl = res?.url;
+                  }
+
+                  if (directUrl) {
+                    await downloadFromDirectUrl(directUrl);
+                    downloadSuccess = true;
+                  } else {
+                    console.log('btch-downloader returned no video URL, falling back to youtubedl...');
+                  }
+                } catch (btchErr) {
+                  console.warn('btch-downloader download attempt failed, falling back to youtubedl:', btchErr.message);
+                }
+
+                // 第二層影片下載備援：使用 youtube-dl-exec
+                if (!downloadSuccess) {
+                  const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
                   try {
-                    if (normalizedVideoUrl.includes('/share/') || normalizedVideoUrl.includes('fb.watch') || normalizedVideoUrl.includes('fb.gg')) {
-                      const redirectRes = await fetch(normalizedVideoUrl, {
-                        method: 'GET',
-                        redirect: 'manual',
-                        headers: { 'User-Agent': 'facebookexternalhit/1.1' }
-                      });
-                      const loc = redirectRes.headers.get('location');
-                      if (loc) {
-                        resolvedFbUrl = loc;
-                        if (resolvedFbUrl.includes('/login/') && resolvedFbUrl.includes('next=')) {
-                          const parsedLoc = new URL(resolvedFbUrl);
-                          const nextParam = parsedLoc.searchParams.get('next');
-                          if (nextParam) resolvedFbUrl = nextParam;
+                    await youtubedl(videoUrl, {
+                      output: tempFilePath,
+                      format: 'worst[ext=mp4]/best[height<=360]', // 限制解析度以降低 CPU/記憶體/頻寬負載
+                      maxFilesize: '200m', // 限制最大 200MB 避免 OOM 崩潰
+                      ffmpegLocation: ffmpegPath, // 讓雲端環境 (Render) 可以正確合成音訊與影像
+                      noCheckCertificates: true,
+                      noWarnings: true
+                    });
+                    downloadSuccess = true;
+                  } catch (ytdlErr) {
+                    if ((ytdlErr.message || '').includes('影片檔案過大') || (ytdlErr.message || '').includes('File is larger than max-filesize')) {
+                      throw new Error('影片檔案過大，請勿傳送大於 200MB 的影片以避免系統過載。');
+                    }
+                    // 若 yt-dlp 解析 Facebook 失敗但錯誤訊息中已解析出 ID (例如 ERROR: [facebook] 1687337192735884: Cannot parse data)
+                    const fbErrIdMatch = (ytdlErr.message || '').match(/\[facebook[^\]]*\]\s*(\d{10,25}):/i);
+                    if (fbErrIdMatch) {
+                      detectedFbId = fbErrIdMatch[1];
+                      const fallbackWatchUrl = `https://www.facebook.com/watch/?v=${detectedFbId}`;
+                      if (!triedFbWatchUrls.has(fallbackWatchUrl)) {
+                        try {
+                          console.log(`Recovering FB video via btch.fbdown using ID from yt-dlp error: ${fallbackWatchUrl}`);
+                          const rescueRes = await btch.fbdown(fallbackWatchUrl);
+                          const rescueDirectUrl = rescueRes?.Normal_video || rescueRes?.HD;
+                          if (rescueDirectUrl) {
+                            await downloadFromDirectUrl(rescueDirectUrl);
+                            downloadSuccess = true;
+                          }
+                        } catch (rescueErr) {
+                          console.warn('FB rescue download failed:', rescueErr.message);
                         }
                       }
                     }
-                  } catch (redirectErr) {
-                    console.warn('Failed to pre-resolve FB redirect:', redirectErr.message);
-                  }
-
-                  const fbIdMatch =
-                    resolvedFbUrl.match(/[?&](?:v|story_fbid)=(\d{10,25})/) ||
-                    resolvedFbUrl.match(/\/(?:videos|reel|reels|posts|permalink)\/(?:[^\/]+\/)?(\d{10,25})/) ||
-                    normalizedVideoUrl.match(/[?&](?:v|story_fbid)=(\d{10,25})/) ||
-                    normalizedVideoUrl.match(/\/(?:videos|reel|reels|posts|permalink)\/(?:[^\/]+\/)?(\d{10,25})/);
-
-                  const fbCandidates = [];
-                  if (fbIdMatch) {
-                    // 正規化為 watch/?v=ID 格式（相容 posts、permalink、reel、群組貼文等格式）
-                    fbCandidates.push(`https://www.facebook.com/watch/?v=${fbIdMatch[1]}`);
-                  }
-                  if (!fbCandidates.includes(resolvedFbUrl)) {
-                    fbCandidates.push(resolvedFbUrl);
-                  }
-                  if (!fbCandidates.includes(normalizedVideoUrl)) {
-                    fbCandidates.push(normalizedVideoUrl);
-                  }
-
-                  for (const candidateUrl of fbCandidates) {
-                    console.log(`Trying btch.fbdown with: ${candidateUrl}`);
-                    const res = await btch.fbdown(candidateUrl);
-                    directUrl = res?.Normal_video || res?.HD;
-                    if (directUrl) break;
-                  }
-                }
-                
-                if (directUrl) {
-                  await downloadFromDirectUrl(directUrl);
-                  downloadSuccess = true;
-                } else {
-                  console.log('btch-downloader returned no video URL, falling back to youtubedl...');
-                }
-              }
-
-              // 預設使用 youtube-dl-exec (支援 IG, TikTok 等大部分平台，以及作為備援)
-              if (!downloadSuccess) {
-                const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-                try {
-                  await youtubedl(videoUrl, {
-                    output: tempFilePath,
-                    format: 'worst[ext=mp4]/best[height<=360]', // 限制解析度以降低 CPU/記憶體/頻寬負載
-                    maxFilesize: '200m', // 限制最大 200MB 避免 OOM 崩潰
-                    ffmpegLocation: ffmpegPath, // 讓雲端環境 (Render) 可以正確合成音訊與影像
-                    noCheckCertificates: true,
-                    noWarnings: true
-                  });
-                } catch (ytdlErr) {
-                  // 若 yt-dlp 解析 Facebook 失敗但錯誤訊息中已解析出影片 ID (例如 ERROR: [facebook] 27791062450560762: Cannot parse data)，用該 ID 再呼叫 btch.fbdown 救援
-                  const fbErrIdMatch = (ytdlErr.message || '').match(/\[facebook[^\]]*\]\s*(\d{10,25}):/i);
-                  if (fbErrIdMatch) {
-                    const fallbackWatchUrl = `https://www.facebook.com/watch/?v=${fbErrIdMatch[1]}`;
-                    console.log(`Recovering FB video via btch.fbdown using ID from yt-dlp error: ${fallbackWatchUrl}`);
-                    const rescueRes = await btch.fbdown(fallbackWatchUrl);
-                    const rescueDirectUrl = rescueRes?.Normal_video || rescueRes?.HD;
-                    if (rescueDirectUrl) {
-                      await downloadFromDirectUrl(rescueDirectUrl);
-                      downloadSuccess = true;
-                    } else {
-                      throw ytdlErr;
+                    if (!downloadSuccess) {
+                      console.warn(`Video download unavailable (${ytdlErr.message}); falling back to social post text/meta extraction.`);
                     }
-                  } else {
-                    throw ytdlErr;
                   }
                 }
               }
 
-              // 尋找實際生成的影片檔案 (處理因為缺少 ffmpeg 而導致輸出不同副檔名如 .webm, .mkv 的情況)
-              if (!fs.existsSync(finalFilePath)) {
-                const dir = path.dirname(tempFilePath);
-                const base = path.basename(tempFilePath, '.mp4');
-                const files = fs.readdirSync(dir);
-                const matchedFile = files.find(f => f.startsWith(base));
-                if (matchedFile) {
-                  finalFilePath = path.join(dir, matchedFile);
-                  console.log(`Found redirected output file: ${finalFilePath}`);
-                  
-                  // 動態判斷 MIME 類型
-                  if (finalFilePath.endsWith('.webm')) {
-                    fileMimeType = 'video/webm';
-                  } else if (finalFilePath.endsWith('.mkv')) {
-                    fileMimeType = 'video/x-matroska';
-                  } else if (finalFilePath.endsWith('.mov')) {
-                    fileMimeType = 'video/quicktime';
-                  } else if (finalFilePath.endsWith('.3gp')) {
-                    fileMimeType = 'video/3gpp';
-                  }
+              // 檢查是否成功產出本地影片檔案
+              let hasLocalVideo = false;
+              if (downloadSuccess) {
+                if (fs.existsSync(finalFilePath) && fs.statSync(finalFilePath).size > 1024) {
+                  hasLocalVideo = true;
                 } else {
-                  throw new Error('找不到下載的影片檔案，下載可能失敗或被中斷。這可能是因為影片超過了 200MB 限制，或是影片設有隱私限制。');
+                  const dir = path.dirname(tempFilePath);
+                  const base = path.basename(tempFilePath, '.mp4');
+                  const files = fs.readdirSync(dir);
+                  const matchedFile = files.find(f => f.startsWith(base));
+                  if (matchedFile) {
+                    finalFilePath = path.join(dir, matchedFile);
+                    if (fs.statSync(finalFilePath).size > 1024) {
+                      hasLocalVideo = true;
+                      console.log(`Found redirected output file: ${finalFilePath}`);
+                      if (finalFilePath.endsWith('.webm')) {
+                        fileMimeType = 'video/webm';
+                      } else if (finalFilePath.endsWith('.mkv')) {
+                        fileMimeType = 'video/x-matroska';
+                      } else if (finalFilePath.endsWith('.mov')) {
+                        fileMimeType = 'video/quicktime';
+                      } else if (finalFilePath.endsWith('.3gp')) {
+                        fileMimeType = 'video/3gpp';
+                      }
+                    }
+                  }
                 }
               }
 
-              console.log(`Uploading video to Gemini (${fileMimeType})...`);
-              // Upload using Gen AI File API
-              const uploadResponse = await ai.files.upload({
-                file: finalFilePath,
-                mimeType: fileMimeType,
-              });
+              if (hasLocalVideo) {
+                console.log(`Uploading video to Gemini (${fileMimeType})...`);
+                const uploadResponse = await ai.files.upload({
+                  file: finalFilePath,
+                  mimeType: fileMimeType,
+                });
 
-              // 確保取得正確的檔案資訊 (相容不同版本的結構)
-              const fileName = uploadResponse.file ? uploadResponse.file.name : uploadResponse.name;
-              uploadedGeminiFileName = fileName;
-              fileUri = uploadResponse.file ? uploadResponse.file.uri : uploadResponse.uri;
-              fileMimeType = uploadResponse.file ? uploadResponse.file.mimeType : (uploadResponse.mimeType || 'video/mp4');
+                const fileName = uploadResponse.file ? uploadResponse.file.name : uploadResponse.name;
+                uploadedGeminiFileName = fileName;
+                fileUri = uploadResponse.file ? uploadResponse.file.uri : uploadResponse.uri;
+                fileMimeType = uploadResponse.file ? uploadResponse.file.mimeType : (uploadResponse.mimeType || 'video/mp4');
 
-              // 等待影片在後台處理完成 (ACTIVE 狀態)
-              let fileState = uploadResponse.file ? uploadResponse.file.state : uploadResponse.state;
-              let retries = 0;
-              while (fileState === 'PROCESSING' && retries < 12) {
-                console.log(`Video processing in Gemini... (${retries + 1}/12)`);
-                await new Promise(resolve => setTimeout(resolve, 5000));
-                const getFileResponse = await ai.files.get({ name: fileName });
-                fileState = getFileResponse.file ? getFileResponse.file.state : getFileResponse.state;
-                retries++;
-              }
+                let fileState = uploadResponse.file ? uploadResponse.file.state : uploadResponse.state;
+                let retries = 0;
+                while (fileState === 'PROCESSING' && retries < 12) {
+                  console.log(`Video processing in Gemini... (${retries + 1}/12)`);
+                  await new Promise(resolve => setTimeout(resolve, 5000));
+                  const getFileResponse = await ai.files.get({ name: fileName });
+                  fileState = getFileResponse.file ? getFileResponse.file.state : getFileResponse.state;
+                  retries++;
+                }
 
-              if (fileState === 'FAILED') {
-                throw new Error('Gemini 處理影片檔案失敗');
-              }
-              if (fileState === 'PROCESSING') {
-                throw new Error('Gemini 處理影片超時');
+                if (fileState === 'FAILED') {
+                  throw new Error('Gemini 處理影片檔案失敗');
+                }
+                if (fileState === 'PROCESSING') {
+                  throw new Error('Gemini 處理影片超時');
+                }
               }
             }
 
-            const prompt = `您是一位專業的內容查核與事實分析專家。
+            const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
+
+            if (fileUri) {
+              // --- 影片分析與事實查核流程 (YouTube 原生網址或已上傳之社群影片) ---
+              const prompt = `您是一位專業的內容查核與事實分析專家。
 請針對這段影片進行詳細的分析，並完成以下任務：
 【影片摘要】：首先，簡單扼要地總結影片的內容與核心重點。
 【關鍵字與主張擷取】：抓取影片中所宣稱的重要資訊、數據或關鍵字。
@@ -1125,28 +1188,133 @@ async function handleEvent(event) {
 【結論與判定】：最後，透過有條理的方式提供您統整後的判定。請明確指出這段影片的內容「哪些是真實的」、「哪些是待商榷或需要再考證的部分」，以及「整體是否可能為網路謠言或假消息」。
 請用繁體中文回覆，語氣客觀且具邏輯性。
 ⚠️ 無障礙排版指示：為了友善視障用戶使用語音讀屏軟體，請「絕對不要」使用任何 Markdown 符號（例如 *星號、-橫槓、#井號等）來進行排版或粗體標示。請直接使用自然段落與中文全形標點符號，確保語音朗讀時順暢無干擾。`;
-            
-            const targetModel = userRecord?.selected_model || 'gemini-3-flash-preview';
 
-            const aiResponse = await ai.models.generateContent({
-              model: targetModel,
-              contents: [
-                { fileData: { fileUri: fileUri, mimeType: fileMimeType } },
-                { text: prompt }
-              ],
-              config: {
-                tools: [{ googleSearch: {} }]
+              const aiResponse = await ai.models.generateContent({
+                model: targetModel,
+                contents: [
+                  { fileData: { fileUri: fileUri, mimeType: fileMimeType } },
+                  { text: prompt }
+                ],
+                config: {
+                  tools: [{ googleSearch: {} }]
+                }
+              });
+
+              const rawReplyText = aiResponse.text || '無法生成摘要';
+              const replyText = sanitizeForAccessibility(rawReplyText);
+              await client.pushMessage(targetId, [{ type: 'text', text: `🎬 【影片摘要】\n\n${replyText}` }]);
+              await saveChatHistory(targetId, userText, `[已為使用者摘要影片] ${replyText}`);
+            } else {
+              // --- 第三層備援：社群圖文貼文 / 無法下載影片時的網頁內文與 OpenGraph 擷取查核 ---
+              console.log(`Falling back to social post text/meta extraction for: ${resolvedSocialUrl}`);
+              let canonicalPostUrl = resolvedSocialUrl;
+
+              // 若有從 yt-dlp 或網址取得 Facebook 貼文 ID，嘗試解析出標準貼文網址（例如 /groups/.../posts/ID）
+              if (detectedFbId && (canonicalPostUrl.includes('/share/') || canonicalPostUrl === videoUrl)) {
+                try {
+                  const idRes = await fetch(`https://www.facebook.com/${detectedFbId}`, {
+                    method: 'GET',
+                    redirect: 'manual',
+                    headers: { 'User-Agent': 'facebookexternalhit/1.1' }
+                  });
+                  const idLoc = idRes.headers.get('location');
+                  if (idLoc && !idLoc.includes('/login/') && !idLoc.includes('profile.php')) {
+                    canonicalPostUrl = idLoc;
+                  }
+                } catch (e) {}
               }
-            });
 
-            const rawReplyText = aiResponse.text || '無法生成摘要';
-            const replyText = sanitizeForAccessibility(rawReplyText);
-            await client.pushMessage(targetId, [{ type: 'text', text: `🎬 【影片摘要】\n\n${replyText}` }]);
-            await saveChatHistory(targetId, userText, `[已為使用者摘要影片] ${replyText}`);
+              const decodeHtmlEntities = (str) => {
+                if (!str) return '';
+                return str
+                  .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+                  .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+                  .replace(/&quot;/g, '"')
+                  .replace(/&apos;/g, "'")
+                  .replace(/&lt;/g, '<')
+                  .replace(/&gt;/g, '>')
+                  .replace(/&amp;/g, '&');
+              };
+
+              let extractedPostParts = [];
+
+              // 1. 透過 facebookexternalhit 擷取 OpenGraph 標題與貼文內文 (針對 FB/IG/Threads 貼文特別有效)
+              try {
+                const metaController = new AbortController();
+                const metaTimeout = setTimeout(() => metaController.abort(), 8000);
+                const metaRes = await fetch(canonicalPostUrl, {
+                  signal: metaController.signal,
+                  headers: { 'User-Agent': 'facebookexternalhit/1.1' }
+                }).finally(() => clearTimeout(metaTimeout));
+
+                if (metaRes.ok) {
+                  const html = await metaRes.text();
+                  const getMeta = (prop) => {
+                    const m = html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i'))
+                      || html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${prop}["']`, 'i'));
+                    return m ? decodeHtmlEntities(m[1]).trim() : '';
+                  };
+                  const ogTitle = getMeta('og:title') || getMeta('twitter:title');
+                  const ogDesc = getMeta('og:description') || getMeta('twitter:description') || getMeta('description');
+                  if (ogTitle) extractedPostParts.push(`貼文標題：${ogTitle}`);
+                  if (ogDesc) extractedPostParts.push(`貼文摘要：\n${ogDesc}`);
+                }
+              } catch (metaErr) {
+                console.warn('Social meta fetch failed:', metaErr.message);
+              }
+
+              // 2. 透過 Jina Reader 擷取完整貼文內文與留言
+              try {
+                const jinaController = new AbortController();
+                const jinaTimeout = setTimeout(() => jinaController.abort(), 12000);
+                const jinaRes = await fetch(`https://r.jina.ai/${canonicalPostUrl}`, {
+                  signal: jinaController.signal
+                }).finally(() => clearTimeout(jinaTimeout));
+
+                if (jinaRes.ok) {
+                  const jinaText = await jinaRes.text();
+                  if (jinaText && jinaText.trim().length >= 80) {
+                    extractedPostParts.push(`完整網頁擷取內容：\n${jinaText.slice(0, 25000)}`);
+                  }
+                }
+              } catch (jinaErr) {
+                console.warn('Social Jina fetch failed:', jinaErr.message);
+              }
+
+              const combinedPostText = extractedPostParts.join('\n\n').trim();
+              if (!combinedPostText || combinedPostText.length < 20) {
+                throw new Error('無法擷取該社群連結的影片或貼文內容，這可能是因為貼文設有私人社團或好友隱私限制。');
+              }
+
+              const postPrompt = `您是一位專業的內容查核與事實分析專家。
+請針對這篇社群貼文進行詳細的分析，並完成以下任務：
+【內容摘要】：首先，簡單扼要地總結這篇貼文的內容與核心重點。
+【關鍵字與主張擷取】：抓取貼文中所宣稱的重要資訊、數據或關鍵字。
+【事實查核與多方比對】：請透過網路搜尋，將貼文中的宣稱與多方權威來源（如權威研究機構、官方數據或專家佐證）進行綜合比對，不要只依賴單一數據來源。
+【結論與判定】：最後，透過有條理的方式提供您統整後的判定。請明確指出這篇貼文的內容「哪些是真實的」、「哪些是待商榷或需要再考證的部分」，以及「整體是否可能為網路謠言、誇大導購或假消息」。
+請用繁體中文回覆，語氣客觀且具邏輯性。
+⚠️ 無障礙排版指示：為了友善視障用戶使用語音讀屏軟體，請「絕對不要」使用任何 Markdown 符號（例如 *星號、-橫槓、#井號等）來進行排版或粗體標示。請直接使用自然段落與中文全形標點符號，確保語音朗讀時順暢無干擾。
+
+# 待分析與查核的社群貼文內容：
+${combinedPostText}`;
+
+              const aiResponse = await ai.models.generateContent({
+                model: targetModel,
+                contents: postPrompt,
+                config: {
+                  tools: [{ googleSearch: {} }]
+                }
+              });
+
+              const rawReplyText = aiResponse.text || '無法生成摘要';
+              const replyText = sanitizeForAccessibility(rawReplyText);
+              await client.pushMessage(targetId, [{ type: 'text', text: `📝 【社群貼文摘要與查核】\n\n${replyText}` }]);
+              await saveChatHistory(targetId, userText, `[已為使用者摘要社群貼文] ${replyText}`);
+            }
             
           } catch (err) {
-            console.error('Video Processing Error:', err);
-            await client.pushMessage(targetId, [{ type: 'text', text: `❌ 處理影片時發生錯誤：\n${err.message}\n\n這可能是因為影片設有隱私限制，或是檔案格式不受支援。` }]);
+            console.error('Video/Social Processing Error:', err);
+            await client.pushMessage(targetId, [{ type: 'text', text: `❌ 處理內容時發生錯誤：\n${err.message}\n\n這可能是因為該內容設有私人社團或隱私權限限制。` }]);
           } finally {
             if (finalFilePath && fs.existsSync(finalFilePath)) {
               try { fs.unlinkSync(finalFilePath); } catch (e) {}
@@ -1177,10 +1345,6 @@ async function handleEvent(event) {
         while (rawUrl.endsWith(')') && (rawUrl.match(/\(/g) || []).length < (rawUrl.match(/\)/g) || []).length) {
           rawUrl = rawUrl.slice(0, -1);
         }
-        
-        // 1. 若內容包含提醒、行程、通知等關鍵字，應放行給 AI 意圖分析處理（保留網址於任務內）
-        const reminderKeywords = ['提醒', '叫我', '通知', '聚會', '吃飯', '行程', '約會', '開會', '會議', '出發', '幾點', '記得', '預約', '備忘'];
-        const isReminderIntent = reminderKeywords.some(kw => userText.includes(kw));
 
         // 2. 過濾明顯非新聞的網址（雲端硬碟、電商、地圖導航等）
         const nonNewsDomains = [
